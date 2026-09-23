@@ -1,271 +1,86 @@
-<div align="center">
+# NexusAgent
 
-# 🔮 NexusAgent
+Python 智能体框架。主循环用 LangGraph 调度工具；复杂任务可以拆成 Planner、Worker、Reviewer 协作；知识检索用本地 TF-IDF；工具调用带沙盒约束和风险评分。
 
-### **多Agent协作 · RAG知识增强 · 安全可控的下一代透明智能体**
+Python 3.10+ · MIT License
 
-[![NexusAgent](https://img.shields.io/badge/NexusAgent-2.0.0-purple.svg)](https://github.com/your-repo/NexusAgent)
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![LangGraph](https://img.shields.io/badge/LangGraph-1.x-blue.svg)](https://langchain-ai.github.io/langgraph/)
-[![Tests](https://img.shields.io/badge/Tests-19%20Passed-brightgreen.svg)](tests/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+## 能力
 
-**下一代透明智能体架构** · 3 大核心模块 · 15+ 内置工具 · 全测试覆盖
-
-[核心能力](#-核心能力) · [架构设计](#-系统架构) · [功能详解](#-功能详解) · [快速开始](#-快速开始) · [性能指标](#-性能基准测试)
-
-</div>
-
----
-
-## 📖 项目简介
-
-NexusAgent 是一个从零设计的**企业级透明可控 AI 智能体框架**，聚焦于解决 AI Agent 的透明性、安全性和能力扩展三大核心问题，具备三大核心功能模块：
-
-| 核心模块 | 技术实现 | 核心价值 |
-|----------|----------|----------|
-| 🤖 **多Agent协作引擎** | Planner→Worker→Reviewer 三阶段 DAG 编排 | 复杂任务自动拆解，并行执行提速 40% |
-| 📚 **RAG 知识库引擎** | TF-IDF 向量检索 + 智能文档切片 | BEIR SciFact 基准 NDCG@10=0.676，超过 BM25 基线(0.665) |
-| 🛡️ **安全评分仪表盘** | 实时风险评估 + 异常行为检测 | 100%准确率(41场景验证)，误报率0% |
-
----
-
-## 🌟 核心能力
-
-### 基础架构能力
-
-| 能力 | 技术实现 | 量化指标 |
-|------|----------|----------|
-| **🧠 双水位记忆** | 长期画像 (Markdown) + 短期摘要 (SQLite) + 自动裁剪 | 每20轮自动摘要，保留最近10轮 |
-| **🔍 全行为审计** | JSONL 异步日志 + Rich 实时监控终端 | 5 类事件全覆盖，写入延迟 < 1ms |
-| **🛡️ 零信任执行** | help→run 两段式调用 + 沙盒路径拦截 | P0 事故率从 50% 降至 10%（降低 80%）|
-| **⏰ 心跳任务引擎** | asyncio 后台协程 + JSON 持久化 | 每 10s 检查队列，支持 daily/weekly/monthly |
-| **🖥️ 跨平台兼容** | 系统信息注入 + LLM 自主选择命令 | Win/Linux/macOS 全平台覆盖 |
-
-### 高级能力
-
-| 能力 | 技术实现 | 量化指标 |
-|------|----------|----------|
-| **🤖 多Agent协作** | asyncio 并发 + DAG 拓扑调度（经 `multi_agent_collaborate` 工具接入主 Agent） | 并行执行提速 40%，子任务成功率 97% |
-| **📚 RAG 知识检索** | TF-IDF 稀疏向量 + 余弦相似度 + 智能切片 | BEIR SciFact 标准基准 NDCG@10=0.6759（超过 BM25 基线 0.6647），Recall@100=90.9%，平均延迟 89ms/query（1083 文档规模） |
-| **🛡️ 安全评分** | 滑动窗口风险评估 + 连续异常检测 + 时间衰减 | 异常检测准确率 100% (41场景)，误报率 0% |
-
----
-
-## 🚀 功能详解
-
-### 1. 🤖 多Agent协作引擎 (`multi_agent.py`)
-
-**架构**: Planner → Worker → Reviewer 三阶段协作
-
-```
-用户复杂任务
-     ↓
-┌─────────────────────────────┐
-│  Planner Agent (任务拆解)    │  将大任务拆为 3-6 个子任务
-│  输出: 子任务 DAG            │  标注依赖关系
-└─────────────────────────────┘
-     ↓
-┌─────────────────────────────┐
-│  Worker Agents (并行执行)    │  无依赖子任务并发执行
-│  并发控制: Semaphore(3)      │  失败自动重试（最多2次）
-│  DAG 调度: 拓扑排序执行       │
-└─────────────────────────────┘
-     ↓
-┌─────────────────────────────┐
-│  Reviewer Agent (审查合并)   │  检查一致性
-│  输出: 最终整合答案           │  合并为完整回答
-└─────────────────────────────┘
-```
-
-**集成方式**：主 Agent（`agent.py` 的 LangGraph StateGraph）在复杂任务场景下调用 `multi_agent_collaborate` 工具，工具内部运行本引擎并将结果作为 ToolMessage 返回。
-
-**技术亮点**:
-- **DAG 依赖调度**：基于拓扑排序的任务调度，确保执行顺序零错误
-- **asyncio 并发**：无依赖子任务并行执行，Semaphore 控制并发数
-- **智能重试**：单个子任务失败自动重试，最多 2 次
-- **死锁检测**：自动检测循环依赖并标记失败
-
-### 2. 📚 RAG 知识库引擎 (`rag_engine.py`)
-
-**架构**: 文档加载 → 智能切片 → TF-IDF 索引 → 语义检索 → 上下文注入
-
-**技术亮点**:
-- **纯 Python 实现**：零外部向量数据库依赖
-- **中英文混合分词**：字符级 n-gram，支持中文单字+双字+英文词
-- **智能边界切片**：优先在段落/句子边界分割
-- **增量索引 + 去重**：MD5 哈希去重
-
-### 3. 🛡️ 安全评分仪表盘 (`security_scorer.py`)
-
-**架构**: 操作记录 → 风险评分 → 异常检测 → 审计报告
-
-**技术亮点**:
-- **实时评分**：每次工具调用自动更新，延迟 < 0.02ms (13μs)
-- **时间衰减机制**：10 分钟线性衰减
-- **五级风险分级**：🟢安全 → 🟡低 → 🟠中 → 🔴高 → 🚨危险
-- **自动审计报告**：Markdown 格式安全评估
-
----
-
-## 🏗️ 系统架构
-
-```
-NexusAgent 系统架构
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-┌───────────────────────────────────────────────┐
-│                  输入层                        │
-│  Heartbeat 心跳  ←→  用户输入  ←→  CLI        │
-└──────────────────────┬────────────────────────┘
-                       ↓
-┌───────────────────────────────────────────────┐
-│          记忆层 + RAG 检索增强                  │
-│  长期画像(MD) + 短期摘要(SQLite) + RAG(TF-IDF) │
-└──────────────────────┬────────────────────────┘
-                       ↓
-┌───────────────────────────────────────────────┐
-│      智能决策层 (Agent Loop + 多Agent编排)      │
-│  主 Agent: LangGraph StateGraph (agent↔tools) │
-│  多Agent: asyncio DAG (Planner→Worker→Review) │
-└──────────────────────┬────────────────────────┘
-                       ↓
-┌───────────────────────────────────────────────┐
-│        工具执行层 (15个内置工具 + Skills)        │
-│  沙盒隔离 + 路径拦截 + Shell安全 + 两段式调用    │
-└──────────────────────┬────────────────────────┘
-                       ↓
-┌───────────────────────────────────────────────┐
-│       安全评分 + 透明监控                       │
-│  实时风险(0-100) + JSONL审计 + Rich终端 + 报告  │
-└───────────────────────────────────────────────┘
-```
-
----
-
-## 📊 性能基准测试
-
-### 两阶段调用安全性
-
-| 指标 | 单阶段 | 两阶段 | 提升 |
-|------|--------|--------|------|
-| **安全命中率** | 50.0% | 90.0% | **+40pp** |
-| **P0 事故率** | 50.0% | 10.0% | **-80%** |
-| **破坏性执行** | 存在 | 0 次 | **100%拦截** |
-
-### 懒加载性能
-
-| 指标 | 预加载 | 懒加载 | 改善 |
-|------|--------|--------|------|
-| **启动时间(100技能)** | ~200ms | ~0.41ms | **⬇️99%+** |
-| **内存占用(100技能)** | ~250KB | ~50KB | **⬇️93%** |
-
-### RAG 知识库（BEIR SciFact 标准基准测试）
-
-> 数据集: BEIR SciFact (Thakur et al., NeurIPS 2021)，1083 篇生物医学论文摘要，5728 个切片，300 条测试查询
-
-| 指标 | NexusAgent TF-IDF | BM25 基线 (Anserini) |
-|------|-------------------|----------------------|
-| **NDCG@10** | **0.6759** | 0.6647 |
-| **Recall@10** | 0.8087 | - |
-| **Recall@100** | 0.9091 | - |
-| **MRR@10** | 0.6412 | - |
-| **平均延迟** | 89.44ms/query | - |
-| **P99延迟** | 115.05ms/query | - |
-
-对比其他基线 (BEIR 论文 Table 2):
-- DPR: NDCG@10 = 0.3183
-- ANCE: NDCG@10 = 0.5072
-- TAS-B: NDCG@10 = 0.6431
-
-### 安全评分
-
-| 指标 | 数值 |
+| 模块 | 实现 |
 |------|------|
-| **评分延迟** | < 0.02ms (平均13μs, P99 22μs) |
-| **异常检测准确率** | 100% (41/41) |
-| **误报率** | 0% |
-| **漏报率** | 0% |
-| **报告生成耗时** | 0.02ms |
+| 多 Agent 协作 | Planner 拆任务，Worker 按 DAG 并行执行，Reviewer 合并结果。主 Agent 通过 `multi_agent_collaborate` 调用 |
+| RAG | 纯 Python TF-IDF，按段落边界切片，MD5 去重。不依赖外部向量库 |
+| 安全评分 | 滑动窗口打分（0–100），带时间衰减和连续异常检测，可输出 Markdown 报告 |
+| 执行约束 | 技能先 `help` 再 `run`；沙盒限制路径和 shell |
+| 记忆 | 长期画像写在 Markdown，短期摘要放在 SQLite，超长对话自动裁剪 |
+| 审计 | 工具调用、模型输入输出等事件写入 JSONL，可用 Rich 终端查看 |
+| 技能加载 | 启动时只读元数据，首次调用再加载正文，LRU 缓存 |
+| 定时任务 | asyncio 后台检查队列，支持按日、周、月重复 |
 
----
+## 架构
 
-## ⚔️ 与同类框架对比
+```
+用户输入 / 定时任务
+        │
+        ▼
+记忆与检索（画像、摘要、TF-IDF）
+        │
+        ▼
+主 Agent（LangGraph：推理 ↔ 工具）
+        │
+        ├── 内置工具与技能
+        └── 多 Agent（Planner → Worker → Reviewer）
+        │
+        ▼
+沙盒执行、风险评分、JSONL 审计
+```
 
-| 特性 | NexusAgent | LangChain Agent | Claude Code | AutoGPT |
-|------|-----------|-----------------|-------------|---------|
-| 多Agent协作 | ✅ DAG编排 | ❌ 单Agent | ❌ | ❌ |
-| 内置 RAG | ✅ TF-IDF (零依赖) | 需外接向量DB | ❌ | 需外接 |
-| 全行为审计 | ✅ JSONL 5类事件 | ❌ | 部分 | ❌ |
-| 实时安全评分 | ✅ 0-100分制 | ❌ | ❌ | ❌ |
-| 沙盒隔离 | ✅ 5层防御 | ❌ | ✅ 权限确认 | ⚠️ 有限 |
-| 两段式执行 | ✅ help→run | ❌ | ❌ | ❌ |
-| 外部依赖 | 轻量 | 中等 | 闭源 | 重 |
+## 检索基准
 
----
+BEIR SciFact（Thakur et al., NeurIPS 2021）：1083 篇生物医学摘要，5728 个切片，300 条查询。
 
-## 🚀 快速开始
+| 指标 | NexusAgent TF-IDF | BM25（Anserini） |
+|------|-------------------|------------------|
+| NDCG@10 | 0.6759 | 0.6647 |
+| Recall@10 | 0.8087 | — |
+| Recall@100 | 0.9091 | — |
+| MRR@10 | 0.6412 | — |
+| 平均延迟 | 89.44 ms/query | — |
+| P99 延迟 | 115.05 ms/query | — |
 
-### 1️⃣ 安装
+同一张 BEIR 表里，DPR、ANCE、TAS-B 的 NDCG@10 分别为 0.3183、0.5072、0.6431。这是稀疏检索在 SciFact 上的结果，不是通用问答榜单。
+
+## 快速开始
 
 ```bash
-git clone <your-repo-url>/NexusAgent.git
+git clone https://github.com/Doublec0413/NexusAgent.git
 cd NexusAgent
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
+cp .env.example .env
 ```
 
-### 2️⃣ 配置
+在 `.env` 里填写模型提供商和 API Key，然后：
 
 ```bash
 nexusagent config    # 交互式配置
-# 或手动: cp .env.example .env && vim .env
+nexusagent run       # 启动
+nexusagent monitor   # 另开一个终端查看审计日志
 ```
 
-### 3️⃣ 运行
+支持 OpenAI 兼容接口、Anthropic 和本地 Ollama。部署细节见 [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md)，技能懒加载见 [docs/LAZY_LOADING_GUIDE.md](docs/LAZY_LOADING_GUIDE.md)。
 
-```bash
-nexusagent run       # 启动主程序
-nexusagent monitor   # 启动监控（另一个终端）
-```
-
----
-
-## 📁 项目结构
+## 项目结构
 
 ```
-NexusAgent/
-├── nexusagent/core/
-│   ├── agent.py                  # Agent 循环（集成RAG+安全）
-│   ├── multi_agent.py            # 多Agent协作引擎
-│   ├── rag_engine.py             # RAG 知识库引擎
-│   ├── security_scorer.py     # 安全评分仪表盘
-│   ├── context.py                # 上下文裁剪
-│   ├── provider.py               # LLM 适配工厂
-│   ├── skill_loader.py           # 懒加载技能
-│   ├── config.py                 # 配置管理
-│   ├── logger.py                 # 异步审计日志
-│   ├── heartbeat.py              # 心跳任务
-│   └── tools/
-│       ├── builtins.py           # 15个内置工具
-│       └── sandbox_tools.py      # 沙盒安全工具
-├── entry/                        # CLI入口
-├── tests/                        # 测试套件
-├── workspace/                    # 运行时数据
-│   ├── knowledge/                # RAG知识库
-│   └── reports/                  # 安全报告
-└── docs/                         # 文档
+nexusagent/core/     主循环、多 Agent、RAG、安全评分、记忆与审计
+nexusagent/core/tools/  内置工具（通用、知识、调度、沙盒、安全）
+entry/               命令行入口
+tests/               测试与基准脚本
+docs/                部署和懒加载说明
 ```
 
----
+## 许可证
 
-## 📄 许可证
-
-MIT License
-
-<div align="center">
-
-**🔮 NexusAgent · 多Agent协作 · RAG知识增强 · 安全可控**
-
-</div>
+[MIT](LICENSE)
