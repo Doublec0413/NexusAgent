@@ -27,3 +27,31 @@ workspace/memory/*.md
 workspace/office
 
 *.egg-info/
+
+# 本地数据集、演示文稿与运行报告，不上传远程
+tests/beir_data/
+docs/NexusAgent_求职项目介绍.pptx
+docs/Projects_Combined_Presentation.pptx
+docs/Projects_Combined_Presentation.backup.pptx
+workspace/reports/
+
+# 求职、演讲、学习笔记和本机环境，不纳入仓库
+docs/NexusAgent_演讲稿.md
+docs/RESUME_GUIDE.md
+docs/study_guide.html
+docs/two_phase_comparison.html
+docs/assets/
+docs/*:Zone.Identifier
+*:Zone.Identifier
+scripts/generate_job_ppt.py
+scripts/generate_job_ppt_compact.py
+scripts/merge_nexusagent_into_combined.py
+.vscode/
+tests/benchmark_results.json
+tests/benchmark_beir_results.json
+
+# 长文档留在本机，不纳入仓库
+CHANGELOG.md
+docs/TECHNICAL_DEEP_DIVE.md
+docs/LAZY_LOADING_QUICKSTART.md
+docs/LAZY_LOADING_SUMMARY.md

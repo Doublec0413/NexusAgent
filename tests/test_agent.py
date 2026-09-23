@@ -25,7 +25,7 @@ class TestAgent(unittest.TestCase):
 
     @patch('nexusagent.core.provider.get_provider')
     @patch('nexusagent.core.skill_loader.load_dynamic_skills')
-    @patch('nexusagent.core.tools.builtins.BUILTIN_TOOLS', [])
+    @patch('nexusagent.core.tools.BUILTIN_TOOLS', [])
     def test_create_agent_app_basic(self, mock_load_skills, mock_get_provider):
         """测试创建基础代理应用（带 Mock）"""
         from nexusagent.core.agent import create_agent_app
@@ -48,7 +48,7 @@ class TestAgent(unittest.TestCase):
 
     @patch('nexusagent.core.provider.get_provider')
     @patch('nexusagent.core.skill_loader.load_dynamic_skills')
-    @patch('nexusagent.core.tools.builtins.BUILTIN_TOOLS', [])
+    @patch('nexusagent.core.tools.BUILTIN_TOOLS', [])
     def test_create_agent_app_with_custom_tools(self, mock_load_skills, mock_get_provider):
         """测试创建带有自定义工具的代理应用（带 Mock）"""
         from nexusagent.core.agent import create_agent_app
@@ -81,7 +81,7 @@ class TestAgent(unittest.TestCase):
 
     @patch('nexusagent.core.provider.get_provider')
     @patch('nexusagent.core.skill_loader.load_dynamic_skills')
-    @patch('nexusagent.core.tools.builtins.BUILTIN_TOOLS', [])
+    @patch('nexusagent.core.tools.BUILTIN_TOOLS', [])
     def test_create_agent_app_with_checkpointer(self, mock_load_skills, mock_get_provider):
         """测试创建带有检查点的代理应用（带 Mock）"""
         from nexusagent.core.agent import create_agent_app

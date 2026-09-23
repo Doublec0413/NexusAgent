@@ -2,6 +2,7 @@ import os
 import subprocess
 from .base import nexusagent_tool
 from ..config import OFFICE_DIR
+from ..sandbox_protocol import format_path_blocked, format_permission_denied
 import re
 import platform
 
@@ -19,7 +20,7 @@ def _get_safe_path(relative_path: str) -> str:
     
     # 核心防御：目标路径必须以 OFFICE_DIR 开头！
     if not target_path.startswith(base_dir):
-        raise PermissionError(f"越权拦截：你试图访问沙盒外的路径 '{relative_path}'！你只能在 office 工位内活动。")
+        raise PermissionError(format_path_blocked(relative_path))
     
     return target_path
 
@@ -115,7 +116,7 @@ def execute_office_shell(command: str) -> str:
     在 office 工位中执行 Shell 命令。
     
     ⚠️ 【极其重要的环境限制】：
-    1. 💻 跨平台注意：当前宿主机可能是 Windows、Linux 或 Mac。请根据你得到的环境反馈，使用对应的原生 Shell 命令（例如 Win 用 dir/del，Linux 用 ls/rm）。如果命令报错，请自行调整重试！
+    1. 跨平台注意：当前宿主机可能是 Windows、Linux 或 Mac。请根据你得到的环境反馈，使用对应的原生 Shell 命令（例如 Win 用 dir/del，Linux 用 ls/rm）。如果命令报错，请自行调整重试！
     2. 这是一个非交互式终端！所有命令必须携带免确认参数（如 -y, --quiet）。
     3. 禁止使用 cd 命令跳出当前目录，你的活动范围仅限 office。
     4. [无状态警告] 每次执行都是独立的终端进程！需要进入子目录请使用“命令链”或相对路径。
@@ -131,7 +132,9 @@ def execute_office_shell(command: str) -> str:
         ]
         for pattern in dangerous_patterns:
             if re.search(pattern, command):
-                return f"❌ 权限拒绝：检测到危险的目录跳转指令。你被禁止离开 office 工位！"
+                return format_permission_denied(
+                    "检测到危险的目录跳转指令。你被禁止离开 office 工位！"
+                )
 
         result = subprocess.run(
             command,

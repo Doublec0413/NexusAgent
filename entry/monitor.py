@@ -28,17 +28,19 @@ LOG_FILE = os.path.join(PROJECT_ROOT, "logs", "local_geek_master.jsonl")
 def print_header():
     """渲染 简约斜体版·NexusAgent 监控面板"""
     
-    monster = (
-        "  ▄█▄▄█▄  \n"
-        " ▀██████▀ \n"
-        " ██▄██▄██ \n"
-        "  ▀    ▀  "
+    icon = (
+        "      🔮      \n"
+        "   ╭───────╮   \n"
+        "  ╱  ◉   ◉  ╲  \n"
+        " │     ◉     │ \n"
+        "  ╲    │    ╱  \n"
+        "   ╰────┼────╯  "
     )
     
 
     content = Text(justify="center")
     content.append("\n  Live Stream  \n\n", style="bold white italic")
-    content.append(monster + "\n\n", style="color(141)")
+    content.append(icon + "\n\n", style="color(141)")
     content.append("   What is NexusAgent doing?    \n", style="dim white italic") 
 
     panel = Panel(
@@ -92,20 +94,43 @@ def render_event(line: str):
             
         elif event == "tool_call":
             tool_name = data.get("tool", "unknown")
-            args_str = json.dumps(data.get("args", {}), ensure_ascii=False, indent=2) 
-            content = f"[bold white] ● 使用工具: [/bold white][bold color(141)]{tool_name}[/bold color(141)]\n传入参数:\n{args_str}"
-            console.print(Panel(content, title=f"✦ 意图决断 [ {ts} ]", title_align="left", border_style="color(141)", width=60))
-            
+            args_str = json.dumps(data.get("args", {}), ensure_ascii=False, indent=2)
+            phase_titles = {
+                "planner_agent": ("Phase 1 · Planner 任务拆解", "bright_yellow"),
+                "reviewer_agent": ("Phase 3 · Reviewer 审查合并", "bright_green"),
+            }
+            if tool_name.startswith("worker_agent"):
+                title, border = f"Phase 2 · Worker 执行 [{tool_name}]", "bright_cyan"
+            elif tool_name in phase_titles:
+                title, border = phase_titles[tool_name]
+            elif tool_name == "multi_agent_collaborate":
+                title, border = "多Agent协作 · 启动编排", "color(141)"
+            else:
+                title, border = f"意图决断 · {tool_name}", "color(141)"
+            content = f"[bold white] ● 工具: [/bold white][bold]{tool_name}[/bold]\n传入参数:\n{args_str}"
+            console.print(Panel(content, title=f"✦ {title} [ {ts} ]", title_align="left", border_style=border, width=60))
+
         elif event == "tool_result":
             tool_name = data.get("tool", "unknown")
             result = data.get("result_summary", "")
             display_result = result[:300] + "\n...[截断]..." if len(result) > 300 else result
-            content = f"[bold white] ● 执行结果: [/bold white][bold cyan]{tool_name}[/bold cyan]\n{display_result}"
-            console.print(Panel(content, title=f"✦ 环境回传 [ {ts} ]", title_align="left", border_style="cyan", width=60))
-            
+            if tool_name.startswith("worker_agent"):
+                title, border = f"Phase 2 · Worker 回传 [{tool_name}]", "bright_cyan"
+            elif tool_name == "planner_agent":
+                title, border = "Phase 1 · Planner 完成", "bright_yellow"
+            elif tool_name == "reviewer_agent":
+                title, border = "Phase 3 · Reviewer 完成", "bright_green"
+            else:
+                title, border = f"环境回传 · {tool_name}", "cyan"
+            content = f"[bold white] ● 结果: [/bold white][bold]{tool_name}[/bold]\n{display_result}"
+            console.print(Panel(content, title=f"✦ {title} [ {ts} ]", title_align="left", border_style=border, width=60))
+
         elif event == "system_action":
             action = data.get("content", "")
-            console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
+            if "多Agent编排" in action:
+                console.print(f"{prefix}[warning bold]🤖 {action}[/warning bold]")
+            else:
+                console.print(f"{prefix}[warning]✦ 底层状态机：{action}[/warning]")
             
     except: pass
 

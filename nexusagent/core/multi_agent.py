@@ -6,10 +6,12 @@ NexusAgent 多Agent协作引擎 (Multi-Agent Orchestrator)
 2. Worker Agents: 并行/串行执行子任务（支持并发控制）
 3. Reviewer Agent: 审查所有子任务输出，合并为最终答案
 
+集成方式：
+- 由主 Agent（LangGraph StateGraph）通过 multi_agent_collaborate 工具调用，非 LangGraph 节点
+
 核心技术：
-- LangGraph StateGraph 编排多Agent状态流转
-- asyncio 并发执行独立子任务，提升吞吐
-- 子任务DAG依赖分析，确保执行顺序正确
+- asyncio + 手写 DAG 拓扑调度（_execute_dag），无依赖子任务并行执行
+- 子任务依赖分析，确保执行顺序正确
 - 失败重试机制，单个子任务最多重试2次
 """
 
@@ -136,20 +138,24 @@ class MultiAgentOrchestrator:
         """
         plan_prompt = SystemMessage(content=(
             "你是一个任务规划专家。你的职责是将用户的复杂任务拆解为3-6个可独立执行的子任务。\n\n"
+
             "输出格式（严格遵守）：\n"
             "SUBTASK|<编号>|<子任务描述>|<依赖的编号列表,用逗号分隔,无依赖填none>\n\n"
+
             "示例：\n"
             "SUBTASK|1|调研Python Web框架的市场份额|none\n"
             "SUBTASK|2|对比Django和FastAPI的性能差异|none\n"
             "SUBTASK|3|根据调研结果给出框架选型建议|1,2\n\n"
+            
             "要求：\n"
-            "1. 每个子任务要足够具体，可以独立执行\n"
-            "2. 正确标注依赖关系（哪些任务需要在其他任务完成后才能开始）\n"
-            "3. 无依赖的任务可以并行执行\n"
-            "4. 只输出SUBTASK行，不要输出任何其他内容"
+            "1. 每个子任务要足够具体，可以由一个Agent独立完成\n"
+            "2. 避免生成过大的任务，例如“完成系统开发”。"
+            "3. 正确标注依赖关系（哪些任务需要在其他任务完成后才能开始），注意不允许循环依赖。\n"
+            "4. 无依赖的任务可以并行执行\n"
+            "5. 只输出SUBTASK行，不要输出任何其他内容"
         ))
 
-        response = self.llm.invoke([plan_prompt, HumanMessage(content=user_task)])
+        response = await self.llm.ainvoke([plan_prompt, HumanMessage(content=user_task)])
 
         audit_logger.log_event(
             thread_id=thread_id,
@@ -252,11 +258,16 @@ class MultiAgentOrchestrator:
             if dep_context:
                 worker_prompt += f"\n参考上下文（前置任务的输出）：{dep_context}\n"
 
-            worker_prompt += "\n要求：直接给出结果，简洁专业，不要废话。"
+            worker_prompt += (
+                "\n要求：\n"
+                "1. 直接给出可用结果，不要开场白、客套和重复总结\n"
+                "2. 保留关键事实、数据、对比点和必要论据，勿因「简洁」省略实质内容\n"
+                "3. 若任务适合结构化输出，用简洁条目或小标题组织，便于后续汇总"
+            )
 
             for attempt in range(task.max_retries + 1):
                 try:
-                    response = self.llm.invoke([HumanMessage(content=worker_prompt)])
+                    response = await self.llm.ainvoke([HumanMessage(content=worker_prompt)])
                     task.result = response.content
                     task.status = TaskStatus.COMPLETED
                     task.execution_time = time.time() - start
@@ -286,7 +297,7 @@ class MultiAgentOrchestrator:
                 f"\n--- 子任务 {i} {status_icon} ---\n"
                 f"描述: {task.description}\n"
                 f"状态: {task.status.value}\n"
-                f"结果: {task.result[:500]}\n"
+                f"结果: {task.result}\n"
             )
 
         review_prompt = (
@@ -297,10 +308,11 @@ class MultiAgentOrchestrator:
             f"1. 检查各子任务的输出是否正确、是否有矛盾\n"
             f"2. 将所有结果整合为一个完整、连贯的最终答案\n"
             f"3. 如果有子任务失败，说明影响并给出补救建议\n"
-            f"4. 直接输出最终答案，语言简洁专业"
+            f"4. 若原始任务要求输出结构化 Markdown 报告，必须输出完整报告正文（含所有章节、表格和细节），禁止仅给摘要或一句话结论\n"
+            f"5. 直接输出最终答案，保留子任务中的关键细节"
         )
 
-        response = self.llm.invoke([HumanMessage(content=review_prompt)])
+        response = await self.llm.ainvoke([HumanMessage(content=review_prompt)])
 
         audit_logger.log_event(
             thread_id=thread_id,

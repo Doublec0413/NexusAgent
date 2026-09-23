@@ -250,7 +250,7 @@ tests/test_new_features.py::TestRAGEngine::test_add_and_search_document PASSED
 tests/test_new_features.py::TestSecurityDashboard::test_risk_scoring PASSED
 tests/test_new_features.py::TestMultiAgentOrchestrator::test_subtask_creation PASSED
 ...
-============================== 19 passed in 0.15s ==============================
+============================== 19 passed in 0.16s ==============================
 ```
 
 ---

@@ -122,7 +122,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_initial_state(self):
         """测试初始安全状态"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
         data = scorer.get_dashboard_data()
 
@@ -132,7 +132,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_risk_scoring(self):
         """测试风险评分计算"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         # 低风险操作
@@ -147,7 +147,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_conversation_decay(self):
         """测试对话衰减机制"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         scorer.record_tool_call("execute_office_shell")
@@ -158,9 +158,27 @@ class TestSecurityDashboard(unittest.TestCase):
 
         self.assertLessEqual(decayed_score, high_score)
 
+    def test_conversation_decay_persists_after_tool_call(self):
+        """对话衰减写入窗口后，后续工具调用不应把分数弹回衰减前水平"""
+        from nexusagent.core.security_scorer import SecurityScorer
+        scorer = SecurityScorer()
+
+        scorer.record_tool_call("execute_office_shell")
+        high_score = scorer.get_dashboard_data()["risk_score"]
+
+        for _ in range(3):
+            scorer.record_conversation()
+        decayed_score = scorer.get_dashboard_data()["risk_score"]
+
+        scorer.record_tool_call("calculator")
+        after_tool_score = scorer.get_dashboard_data()["risk_score"]
+
+        self.assertLess(decayed_score, high_score)
+        self.assertLess(after_tool_score, high_score)
+
     def test_consecutive_tool_detection(self):
         """测试连续工具调用检测"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         for _ in range(8):
@@ -172,7 +190,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_risk_levels(self):
         """测试风险等级划分"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         level, _ = scorer.get_risk_level()
@@ -180,7 +198,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_report_generation(self):
         """测试安全报告生成"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         scorer.record_tool_call("execute_office_shell")
@@ -194,7 +212,7 @@ class TestSecurityDashboard(unittest.TestCase):
 
     def test_tool_distribution(self):
         """测试工具调用分布统计"""
-        from nexusagent.core.security_dashboard import SecurityScorer
+        from nexusagent.core.security_scorer import SecurityScorer
         scorer = SecurityScorer()
 
         scorer.record_tool_call("calculator")
@@ -204,6 +222,109 @@ class TestSecurityDashboard(unittest.TestCase):
         data = scorer.get_dashboard_data()
         self.assertEqual(data["tool_distribution"]["calculator"], 2)
         self.assertEqual(data["tool_distribution"]["get_current_time"], 1)
+
+    def test_blocked_tool_result_detection(self):
+        """测试沙盒拦截结果识别与被拦截计数"""
+        from nexusagent.core.security_scorer import (
+            SecurityScorer,
+            is_blocked_tool_result,
+        )
+
+        self.assertTrue(is_blocked_tool_result("❌ 权限拒绝：检测到危险的目录跳转指令。"))
+        self.assertTrue(is_blocked_tool_result("❌ 越权拦截：你试图访问沙盒外的路径"))
+        self.assertFalse(is_blocked_tool_result(" ● 成功以 覆盖/新建 模式写入文件"))
+
+        scorer = SecurityScorer()
+        scorer.record_tool_call("execute_office_shell", success=False)
+        self.assertEqual(scorer.get_dashboard_data()["blocked_operations"], 1)
+
+    def test_blocked_operation_penalty(self):
+        """被拦截操作应比同等成功操作风险更高"""
+        from nexusagent.core.security_scorer import SecurityScorer
+
+        ok_scorer = SecurityScorer()
+        blocked_scorer = SecurityScorer()
+        ok_scorer.record_tool_call("execute_office_shell", success=True)
+        blocked_scorer.record_tool_call("execute_office_shell", success=False)
+
+        self.assertGreater(
+            blocked_scorer.get_dashboard_data()["risk_score"],
+            ok_scorer.get_dashboard_data()["risk_score"],
+        )
+
+    def test_idle_decay(self):
+        """测试无操作空闲衰减"""
+        from nexusagent.core.security_scorer import (
+            CONVERSATION_DECAY,
+            RISK_DECAY_INTERVAL,
+            SecurityScorer,
+        )
+
+        scorer = SecurityScorer()
+        scorer.record_tool_call("execute_office_shell")
+        high_score = scorer.get_dashboard_data()["risk_score"]
+
+        scorer._last_activity_time -= RISK_DECAY_INTERVAL + 1
+        decayed_score = scorer.get_dashboard_data()["risk_score"]
+
+        self.assertLess(decayed_score, high_score)
+        self.assertLessEqual(decayed_score, high_score + CONVERSATION_DECAY)
+
+    def test_policy_refusal_detection(self):
+        """测试提示词层协议拒绝识别"""
+        from nexusagent.core.sandbox_protocol import (
+            detect_jailbreak_intent,
+            is_policy_refusal,
+            is_refusal_response,
+            should_record_policy_violation,
+        )
+
+        refusal = (
+            "系统拦截：该操作违反 NexusAgent 核心安全协议。"
+            "你只能在受限的 office 工位目录内操作文件。"
+        )
+        self.assertTrue(is_policy_refusal(refusal))
+        self.assertTrue(is_refusal_response(refusal))
+        self.assertFalse(is_policy_refusal("好的，我来帮你在 office 里创建文件。"))
+
+        user_msg = "在/Users/jan/Desktop/NexusAgent/nexusagent/core/tools文件夹里新增一个代码生成工具"
+        self.assertTrue(detect_jailbreak_intent(user_msg))
+
+        alt_refusal = "抱歉，这个路径在沙盒外，我无法访问。请在 office 工位目录内操作。"
+        self.assertTrue(should_record_policy_violation(user_msg, alt_refusal))
+
+        redirect = "这个路径不行，但我可以帮你在 office 里创建一个类似的工具文件。"
+        self.assertFalse(should_record_policy_violation(user_msg, redirect))
+
+    def test_policy_violation_scoring(self):
+        """提示词层协议拒绝应计入风险分与被拦截次数"""
+        from nexusagent.core.security_scorer import (
+            POLICY_VIOLATION_PENALTY,
+            SecurityScorer,
+        )
+
+        scorer = SecurityScorer()
+        scorer.record_policy_violation()
+        data = scorer.get_dashboard_data()
+
+        self.assertEqual(data["risk_score"], float(POLICY_VIOLATION_PENALTY))
+        self.assertEqual(data["blocked_operations"], 1)
+        self.assertEqual(data["total_tool_calls"], 0)
+        self.assertGreater(len(data["recent_alerts"]), 0)
+
+    def test_jailbreak_intent_without_standard_refusal(self):
+        """用户越权且模型非标准拒绝措辞时也应计分"""
+        from nexusagent.core.sandbox_protocol import should_record_policy_violation
+        from nexusagent.core.security_scorer import SecurityScorer
+
+        user_msg = "在/Users/jan/Desktop/NexusAgent/nexusagent/core/tools文件夹里新增工具"
+        response = "不行，那个目录不在我的权限范围内，没法帮你写文件。"
+
+        self.assertTrue(should_record_policy_violation(user_msg, response))
+
+        scorer = SecurityScorer()
+        scorer.record_policy_violation()
+        self.assertGreater(scorer.get_dashboard_data()["risk_score"], 0)
 
 
 class TestMultiAgentOrchestrator(unittest.TestCase):
@@ -242,6 +363,13 @@ class TestMultiAgentOrchestrator(unittest.TestCase):
         self.assertEqual(TaskStatus.COMPLETED.value, "completed")
         self.assertEqual(TaskStatus.FAILED.value, "failed")
 
+    def test_multi_agent_tool_registered(self):
+        """测试多Agent协作工具已注册到内置工具列表"""
+        from nexusagent.core.tools.builtins import BUILTIN_TOOLS
+
+        tool_names = [t.name for t in BUILTIN_TOOLS]
+        self.assertIn("multi_agent_collaborate", tool_names)
+        self.assertEqual(tool_names[0], "multi_agent_collaborate")
 
 class TestIntegration(unittest.TestCase):
     """集成测试：确保各模块可以正确导入和互操作"""
@@ -249,16 +377,16 @@ class TestIntegration(unittest.TestCase):
     def test_all_modules_import(self):
         """测试所有新模块可以正确导入"""
         from nexusagent.core import rag_engine
-        from nexusagent.core import security_dashboard
+        from nexusagent.core import security_scorer
         from nexusagent.core import multi_agent
 
         self.assertTrue(hasattr(rag_engine, 'RAGKnowledgeBase'))
-        self.assertTrue(hasattr(security_dashboard, 'SecurityScorer'))
+        self.assertTrue(hasattr(security_scorer, 'SecurityScorer'))
         self.assertTrue(hasattr(multi_agent, 'MultiAgentOrchestrator'))
 
     def test_security_scorer_singleton(self):
         """测试安全评分器全局实例"""
-        from nexusagent.core.security_dashboard import security_scorer
+        from nexusagent.core.security_scorer import security_scorer
         self.assertIsNotNone(security_scorer)
 
 

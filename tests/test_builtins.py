@@ -61,8 +61,8 @@ class TestBuiltInTools(unittest.TestCase):
                 result = calculator.invoke({"expression": expr})
                 self.assertIn("计算出错", result)
 
-    @patch('nexusagent.core.tools.builtins.MEMORY_DIR', new_callable=lambda: tempfile.mkdtemp())
-    @patch('nexusagent.core.tools.builtins.PROFILE_PATH', new_callable=lambda: tempfile.mktemp())
+    @patch('nexusagent.core.tools.general_tools.MEMORY_DIR', new_callable=lambda: tempfile.mkdtemp())
+    @patch('nexusagent.core.tools.general_tools.PROFILE_PATH', new_callable=lambda: tempfile.mktemp())
     def test_save_user_profile(self, mock_profile_path, mock_memory_dir):
         """测试保存用户档案功能"""
         from nexusagent.core.tools.builtins import save_user_profile
@@ -88,9 +88,8 @@ class TestScheduledTasks(unittest.TestCase):
         # 创建临时任务文件
         self.temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
         self.original_tasks_file = TASKS_FILE
-        # 更新 TASKS_FILE 指向临时文件
-        import nexusagent.core.tools.builtins
-        nexusagent.core.tools.builtins.TASKS_FILE = self.temp_file.name
+        import nexusagent.core.tools.schedule_tools as schedule_tools
+        schedule_tools.TASKS_FILE = self.temp_file.name
 
     def tearDown(self):
         # 清理临时文件
@@ -98,8 +97,8 @@ class TestScheduledTasks(unittest.TestCase):
         if os.path.exists(self.temp_file.name):
             os.unlink(self.temp_file.name)
         # 恢复原始路径
-        import nexusagent.core.tools.builtins
-        nexusagent.core.tools.builtins.TASKS_FILE = self.original_tasks_file
+        import nexusagent.core.tools.schedule_tools as schedule_tools
+        schedule_tools.TASKS_FILE = self.original_tasks_file
 
     def test_schedule_task_single(self):
         """测试单次任务调度功能"""
@@ -188,8 +187,8 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
 
         # 设置临时任务文件路径
         self.original_tasks_file = TASKS_FILE
-        import nexusagent.core.tools.builtins
-        nexusagent.core.tools.builtins.TASKS_FILE = self.temp_tasks_file.name
+        import nexusagent.core.tools.schedule_tools as schedule_tools
+        schedule_tools.TASKS_FILE = self.temp_tasks_file.name
 
         # 添加一些测试任务
         future_time = (datetime.now().replace(hour=9, minute=0, second=0)
@@ -226,8 +225,8 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
         if os.path.exists(self.temp_tasks_file.name):
             os.unlink(self.temp_tasks_file.name)
         # 恢复原始路径
-        import nexusagent.core.tools.builtins
-        nexusagent.core.tools.builtins.TASKS_FILE = self.original_tasks_file
+        import nexusagent.core.tools.schedule_tools as schedule_tools
+        schedule_tools.TASKS_FILE = self.original_tasks_file
 
     def test_list_scheduled_tasks_non_empty(self):
         """测试列出非空任务列表"""

@@ -5,7 +5,6 @@ import json
 import tempfile
 import asyncio
 from datetime import datetime, timedelta
-from unittest.mock import patch, AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -16,15 +15,11 @@ class TestHeartbeatPacemaker(unittest.TestCase):
         """每个测试前创建临时任务文件"""
         self.temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
         self.original_tasks_file = None
-        
-        # 保存原始 TASKS_FILE 路径
+
         import nexusagent.core.config
         self.original_tasks_file = nexusagent.core.config.TASKS_FILE
-        
-        # 设置临时任务文件
         nexusagent.core.config.TASKS_FILE = self.temp_file.name
-        
-        # 同时 patch heartbeat 模块中的引用
+
         import nexusagent.core.heartbeat
         nexusagent.core.heartbeat.TASKS_FILE = self.temp_file.name
 
@@ -33,165 +28,167 @@ class TestHeartbeatPacemaker(unittest.TestCase):
         self.temp_file.close()
         if os.path.exists(self.temp_file.name):
             os.unlink(self.temp_file.name)
-        
-        # 恢复原始路径
+
         import nexusagent.core.config
         nexusagent.core.config.TASKS_FILE = self.original_tasks_file
-        
+
         import nexusagent.core.heartbeat
         nexusagent.core.heartbeat.TASKS_FILE = self.original_tasks_file
 
+    def _write_tasks(self, tasks):
+        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+
+    def _read_tasks(self):
+        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            return json.loads(content) if content else []
+
     def test_no_tasks_file(self):
-        """测试任务文件不存在时的行为"""
-        from nexusagent.core.heartbeat import pacemaker_loop
-        
-        # 删除临时文件模拟不存在
+        """任务文件不存在时不抛异常且无触发"""
+        from nexusagent.core.heartbeat import process_due_tasks
         os.unlink(self.temp_file.name)
-        
-        # 运行一个周期（不等待实际间隔）
-        async def run_test():
-            # 直接测试逻辑，不实际等待
-            import nexusagent.core.heartbeat as hb
-            # 模拟 TASKS_FILE 不存在
-            with patch.object(hb, 'TASKS_FILE', '/nonexistent/path.json'):
-                # 不应该抛出异常
-                pass
-        
-        asyncio.run(run_test())
-        # 测试通过：没有异常抛出
+        self.assertEqual(process_due_tasks(), [])
 
     def test_empty_tasks_file(self):
-        """测试任务文件为空时的行为"""
-        from nexusagent.core.heartbeat import pacemaker_loop
-        
-        # 写入空内容
+        """空任务文件无触发"""
+        from nexusagent.core.heartbeat import process_due_tasks
         with open(self.temp_file.name, 'w') as f:
             f.write("")
-        
-        # 运行测试
-        async def run_test():
-            import nexusagent.core.heartbeat as hb
-            # 不应该抛出异常
-            pass
-        
-        asyncio.run(run_test())
-        # 测试通过：没有异常抛出
+        self.assertEqual(process_due_tasks(), [])
 
     def test_task_not_yet_due(self):
-        """测试未到时间的任务不会被触发"""
-        # 设置一个未来的任务
+        """未到时间的任务不会被触发，仍保留在文件中"""
+        from nexusagent.core.heartbeat import process_due_tasks
         future_time = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        test_tasks = [{
+        self._write_tasks([{
             "id": "task1",
             "target_time": future_time,
             "description": "未来任务",
             "repeat": None,
             "repeat_count": None
-        }]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证任务文件内容
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["description"], "未来任务")
+        }])
 
-    def test_task_due_and_triggered(self):
-        """测试到期的任务会被触发"""
-        # 设置一个过去的任务（已到期）
+        triggered = process_due_tasks()
+        self.assertEqual(triggered, [])
+        self.assertEqual(len(self._read_tasks()), 1)
+
+    def test_oneshot_due_triggered_and_removed(self):
+        """单次到期任务触发后从文件移除"""
+        from nexusagent.core.heartbeat import process_due_tasks
         past_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        test_tasks = [{
+        self._write_tasks([{
             "id": "task1",
             "target_time": past_time,
             "description": "到期任务",
             "repeat": None,
             "repeat_count": None
-        }]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证任务已写入
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["description"], "到期任务")
+        }])
 
-    def test_repeating_task_daily(self):
-        """测试每日重复任务的处理"""
-        past_time = datetime.now() - timedelta(minutes=5)
-        
-        test_tasks = [{
-            "id": "task1",
-            "target_time": past_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "description": "每日任务",
-            "repeat": "daily",
-            "repeat_count": None  # 无限循环
-        }]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证任务设置正确
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["repeat"], "daily")
+        triggered = process_due_tasks()
+        self.assertEqual(len(triggered), 1)
+        self.assertEqual(triggered[0]["description"], "到期任务")
+        self.assertEqual(self._read_tasks(), [])
 
-    def test_repeating_task_with_count(self):
-        """测试有限次数的重复任务"""
-        past_time = datetime.now() - timedelta(minutes=5)
-        
-        test_tasks = [{
-            "id": "task1",
-            "target_time": past_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "description": "有限重复任务",
+    def test_daily_overdue_catch_up_once(self):
+        """过期多天的 daily 任务只触发一次，并一次追赶到未来"""
+        from nexusagent.core.heartbeat import process_due_tasks
+        now = datetime.now().replace(microsecond=0)
+        overdue = now - timedelta(days=7)
+
+        self._write_tasks([{
+            "id": "wake",
+            "target_time": overdue.strftime("%Y-%m-%d %H:%M:%S"),
+            "description": "叫你起床",
             "repeat": "daily",
-            "repeat_count": 3  # 重复 3 次
-        }]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证任务设置正确
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["repeat_count"], 3)
+            "repeat_count": None
+        }])
+
+        triggered = process_due_tasks(now=now)
+        self.assertEqual(len(triggered), 1)
+
+        remaining = self._read_tasks()
+        self.assertEqual(len(remaining), 1)
+        next_dt = datetime.strptime(remaining[0]["target_time"], "%Y-%m-%d %H:%M:%S")
+        self.assertGreater(next_dt, now)
+        # 应落在「下一个同刻」附近，而不是只 +1 天仍过期
+        self.assertLessEqual(next_dt, now + timedelta(days=1, seconds=1))
+
+        # 立刻再扫一轮不应重复触发
+        triggered_again = process_due_tasks(now=now)
+        self.assertEqual(triggered_again, [])
+
+    def test_repeating_with_count_decrements_once(self):
+        """有限次数循环：过期追赶只扣 1 次额度"""
+        from nexusagent.core.heartbeat import process_due_tasks
+        now = datetime.now().replace(microsecond=0)
+        overdue = now - timedelta(days=5)
+
+        self._write_tasks([{
+            "id": "med",
+            "target_time": overdue.strftime("%Y-%m-%d %H:%M:%S"),
+            "description": "吃药",
+            "repeat": "daily",
+            "repeat_count": 3
+        }])
+
+        process_due_tasks(now=now)
+        remaining = self._read_tasks()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["repeat_count"], 2)
+
+    def test_repeat_count_one_no_reschedule(self):
+        """repeat_count=1 触发后不再续期"""
+        from nexusagent.core.heartbeat import process_due_tasks
+        now = datetime.now().replace(microsecond=0)
+        overdue = now - timedelta(hours=1)
+
+        self._write_tasks([{
+            "id": "last",
+            "target_time": overdue.strftime("%Y-%m-%d %H:%M:%S"),
+            "description": "最后一次",
+            "repeat": "hourly",
+            "repeat_count": 1
+        }])
+
+        triggered = process_due_tasks(now=now)
+        self.assertEqual(len(triggered), 1)
+        self.assertEqual(self._read_tasks(), [])
 
     def test_invalid_time_format_handled(self):
-        """测试无效时间格式被优雅处理"""
-        test_tasks = [{
-            "id": "task1",
-            "target_time": "invalid-time-format",
-            "description": "无效时间任务",
-            "repeat": None,
-            "repeat_count": None
-        }]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证任务已写入（模块内部会处理异常）
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 1)
+        """无效时间格式被跳过，不导致崩溃"""
+        from nexusagent.core.heartbeat import process_due_tasks
+        future_time = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self._write_tasks([
+            {
+                "id": "bad",
+                "target_time": "invalid-time-format",
+                "description": "无效时间任务",
+                "repeat": None,
+                "repeat_count": None
+            },
+            {
+                "id": "ok",
+                "target_time": future_time,
+                "description": "正常任务",
+                "repeat": None,
+                "repeat_count": None
+            }
+        ])
+
+        triggered = process_due_tasks()
+        self.assertEqual(triggered, [])
+        remaining = self._read_tasks()
+        # 没有 triggered 时不写回，原文件仍含两项
+        self.assertEqual(len(remaining), 2)
 
     def test_multiple_tasks_mixed(self):
-        """测试多个混合任务（到期 + 未到期）"""
+        """到期单次任务触发移除，未到期任务保留"""
+        from nexusagent.core.heartbeat import process_due_tasks
         past_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
         future_time = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        
-        test_tasks = [
+
+        self._write_tasks([
             {
                 "id": "task1",
                 "target_time": past_time,
@@ -205,70 +202,82 @@ class TestHeartbeatPacemaker(unittest.TestCase):
                 "description": "未到期任务",
                 "repeat": "daily",
                 "repeat_count": None
-            },
-            {
-                "id": "task3",
-                "target_time": future_time,
-                "description": "另一个未到期任务",
-                "repeat": None,
-                "repeat_count": None
             }
-        ]
-        
-        with open(self.temp_file.name, 'w', encoding='utf-8') as f:
-            json.dump(test_tasks, f, ensure_ascii=False, indent=2)
-        
-        # 验证所有任务已写入
-        with open(self.temp_file.name, 'r', encoding='utf-8') as f:
-            tasks = json.load(f)
-        
-        self.assertEqual(len(tasks), 3)
-        self.assertEqual(tasks[0]["description"], "已到期任务")
-        self.assertEqual(tasks[1]["description"], "未到期任务")
-        self.assertEqual(tasks[2]["description"], "另一个未到期任务")
+        ])
+
+        triggered = process_due_tasks()
+        self.assertEqual(len(triggered), 1)
+        self.assertEqual(triggered[0]["id"], "task1")
+        remaining = self._read_tasks()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], "task2")
+
+    def test_heartbeat_message_contains_task_id(self):
+        from nexusagent.core.heartbeat import format_heartbeat_message
+        from nexusagent.core.bus import HEARTBEAT_PREFIX
+        msg = format_heartbeat_message({"id": "abc123", "description": "吃饭"})
+        self.assertTrue(msg.startswith(HEARTBEAT_PREFIX))
+        self.assertIn("任务ID: abc123", msg)
+        self.assertIn("吃饭", msg)
 
 
-class TestHeartbeatRepeatLogic(unittest.TestCase):
-    """测试重复逻辑的细节"""
+class TestBusHeartbeatPurge(unittest.TestCase):
+    """取消任务后清理队列中的心跳消息"""
 
-    def test_repeat_freq_values(self):
-        """测试支持的重复频率值"""
-        valid_freqs = ["hourly", "daily", "weekly"]
-        
-        for freq in valid_freqs:
-            with self.subTest(freq=freq):
-                # 验证频率值有效
-                self.assertIn(freq, ["hourly", "daily", "weekly"])
+    def setUp(self):
+        import nexusagent.core.bus as bus
+        self.bus = bus
+        bus._cancelled_task_ids.clear()
+        bus._drain_requested.clear()
+        while True:
+            try:
+                bus.task_queue.get_nowait()
+                bus.task_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
-    def test_repeat_count_decrement_logic(self):
-        """测试重复次数递减逻辑"""
-        # 模拟重复次数递减
-        repeat_count = 3
-        
-        # 触发一次后递减
-        if repeat_count > 1:
-            repeat_count -= 1
-        
-        self.assertEqual(repeat_count, 2)
-        
-        # 最后一次触发
-        if repeat_count > 1:
-            repeat_count -= 1
-        else:
-            # 不再续期
-            pass
-        
-        self.assertEqual(repeat_count, 1)
+    def test_mark_and_detect_cancelled_heartbeat(self):
+        self.bus.mark_tasks_cancelled({"dc6c1657"})
+        hb = (
+            f"{self.bus.HEARTBEAT_PREFIX}\n"
+            f"任务ID: dc6c1657\n"
+            f"你设定的定时任务已到期\n"
+            f"任务内容：提醒你吃饭"
+        )
+        self.assertTrue(self.bus.is_cancelled_heartbeat(hb))
+        self.assertFalse(self.bus.is_cancelled_heartbeat("下午好"))
+        other = (
+            f"{self.bus.HEARTBEAT_PREFIX}\n"
+            f"任务ID: other999\n"
+            f"任务内容：叫你起床"
+        )
+        self.assertFalse(self.bus.is_cancelled_heartbeat(other))
 
+    def test_purge_removes_only_cancelled_heartbeats(self):
+        async def run():
+            await self.bus.task_queue.put("用户消息")
+            await self.bus.task_queue.put(
+                f"{self.bus.HEARTBEAT_PREFIX}\n任务ID: aaa\n任务内容：A"
+            )
+            await self.bus.task_queue.put(
+                f"{self.bus.HEARTBEAT_PREFIX}\n任务ID: bbb\n任务内容：B"
+            )
+            self.bus.mark_tasks_cancelled({"aaa"})
+            await self.bus.purge_cancelled_heartbeats()
 
-class TestHeartbeatTaskQueue(unittest.TestCase):
-    """测试任务队列交互"""
+            items = []
+            while True:
+                try:
+                    items.append(self.bus.task_queue.get_nowait())
+                    self.bus.task_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            return items
 
-    def test_task_queue_put_called(self):
-        """测试任务触发时会调用 task_queue.put()"""
-        # 这是一个集成测试的占位符
-        # 实际测试需要 mock task_queue
-        self.assertTrue(True)  # 占位断言
+        items = asyncio.run(run())
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0], "用户消息")
+        self.assertIn("任务ID: bbb", items[1])
 
 
 if __name__ == '__main__':
