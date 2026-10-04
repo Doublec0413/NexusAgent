@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, 
 from .context import AgentState, trim_context_messages
 from .provider import get_provider
 from .tools import BUILTIN_TOOLS
+from .tools.multi_agent_tools import bind_multi_agent_collaborate
 from .logger import audit_logger
 from .config import MEMORY_DIR
 from .skill_loader import load_dynamic_skills
@@ -55,10 +56,15 @@ def create_agent_app(
     checkpointer = None
 ):
     """构建可流式输出的 LangGraph Agent 应用（agent ↔ tools 循环）。"""
-    # 合并内置工具与动态 Skill 工具
+    # 合并内置工具与动态 Skill 工具。协作工具跟主 Agent 用同一套模型。
     if tools is None:
         dynamic_tools = load_dynamic_skills()
-        actual_tools = BUILTIN_TOOLS + dynamic_tools
+        actual_tools = [
+            bind_multi_agent_collaborate(provider_name, model_name)
+            if getattr(tool, "name", None) == "multi_agent_collaborate"
+            else tool
+            for tool in BUILTIN_TOOLS + dynamic_tools
+        ]
     else:
         actual_tools = tools
 

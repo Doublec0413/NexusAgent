@@ -363,6 +363,265 @@ class TestMultiAgentOrchestrator(unittest.TestCase):
         self.assertEqual(TaskStatus.COMPLETED.value, "completed")
         self.assertEqual(TaskStatus.FAILED.value, "failed")
 
+    def test_plan_pairs_task_with_deps(self):
+        """依赖跟任务配对，短行、重复序号、空描述、自依赖都不会连错边"""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator
+
+        content = """好的，我来拆解：
+SUBTASK|x
+SUBTASK|1|做A|2
+SUBTASK|1|重复的A|none
+SUBTASK|4||none
+SUBTASK|2|做B|none
+SUBTASK|3|做C|1,3,9
+"""
+        fake_response = MagicMock()
+        fake_response.content = content
+        fake_llm = MagicMock()
+        fake_llm.ainvoke = AsyncMock(return_value=fake_response)
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=fake_llm):
+            orchestrator = MultiAgentOrchestrator()
+            subtasks = asyncio.run(orchestrator._plan("任务", "test"))
+
+        self.assertEqual([t.description for t in subtasks], ["做A", "做B", "做C"])
+        by_desc = {t.description: t for t in subtasks}
+        self.assertEqual(by_desc["做A"].depends_on, [by_desc["做B"].id])
+        self.assertEqual(by_desc["做B"].depends_on, [])
+        self.assertEqual(by_desc["做C"].depends_on, [by_desc["做A"].id])
+
+    def test_failed_dependency_skips_successors(self):
+        """前置失败时跳过直接和传递后继，无关任务照常执行"""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator, SubTask, TaskStatus
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=MagicMock()):
+            orchestrator = MultiAgentOrchestrator()
+
+        root = SubTask(description="调研市场份额")
+        independent = SubTask(description="对比性能")
+        child = SubTask(description="给出选型建议", depends_on=[root.id, independent.id])
+        grandchild = SubTask(description="写成报告", depends_on=[child.id])
+        executed = []
+
+        async def fake_execute(task, task_map, thread_id):
+            executed.append(task.description)
+            if task.description == "调研市场份额":
+                task.status = TaskStatus.FAILED
+                task.result = "执行失败（重试2次）：Connection timeout"
+            else:
+                task.status = TaskStatus.COMPLETED
+                task.result = "完成"
+
+        orchestrator._execute_single = fake_execute
+        asyncio.run(orchestrator._execute_dag(
+            [root, independent, child, grandchild], "test"
+        ))
+
+        self.assertCountEqual(executed, ["调研市场份额", "对比性能"])
+        self.assertEqual(child.status, TaskStatus.FAILED)
+        self.assertEqual(child.result, "前置任务失败，已跳过")
+        self.assertEqual(grandchild.status, TaskStatus.FAILED)
+        self.assertEqual(grandchild.result, "前置任务失败，已跳过")
+        self.assertEqual(independent.status, TaskStatus.COMPLETED)
+
+    def test_successful_dependency_still_runs(self):
+        """前置成功时后继照常执行"""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator, SubTask, TaskStatus
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=MagicMock()):
+            orchestrator = MultiAgentOrchestrator()
+
+        first = SubTask(description="做A")
+        second = SubTask(description="做B", depends_on=[first.id])
+        executed = []
+
+        async def fake_execute(task, task_map, thread_id):
+            executed.append(task.description)
+            task.status = TaskStatus.COMPLETED
+            task.result = "完成"
+
+        orchestrator._execute_single = fake_execute
+        asyncio.run(orchestrator._execute_dag([first, second], "test"))
+
+        self.assertEqual(executed, ["做A", "做B"])
+        self.assertEqual(second.status, TaskStatus.COMPLETED)
+
+    def test_dependency_cycle_marks_deadlock(self):
+        """循环依赖仍标为死锁，不会当成前置失败跳过"""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator, SubTask, TaskStatus
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=MagicMock()):
+            orchestrator = MultiAgentOrchestrator()
+
+        left = SubTask(description="做A")
+        right = SubTask(description="做B")
+        left.depends_on = [right.id]
+        right.depends_on = [left.id]
+        executed = []
+
+        async def fake_execute(task, task_map, thread_id):
+            executed.append(task.description)
+
+        orchestrator._execute_single = fake_execute
+        asyncio.run(orchestrator._execute_dag([left, right], "test"))
+
+        self.assertEqual(executed, [])
+        self.assertEqual(left.status, TaskStatus.FAILED)
+        self.assertEqual(right.status, TaskStatus.FAILED)
+        self.assertEqual(left.result, "依赖死锁：前置任务未完成")
+        self.assertEqual(right.result, "依赖死锁：前置任务未完成")
+
+    def test_orchestrate_emits_progress_while_running(self):
+        """流水线每个阶段都推进度，主界面不用等全部结束才有输出"""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator
+
+        plan = MagicMock(content="SUBTASK|1|做A|none\nSUBTASK|2|做B|1\n")
+        worker = MagicMock(content="结果")
+        review = MagicMock(content="最终答案")
+        fake_llm = MagicMock()
+        fake_llm.ainvoke = AsyncMock(side_effect=[plan, worker, worker, review])
+        events = []
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=fake_llm), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", return_value=events.append):
+            orchestrator = MultiAgentOrchestrator()
+            result = asyncio.run(orchestrator.orchestrate("对比两个框架", "test"))
+
+        self.assertEqual(result.final_answer, "最终答案")
+        self.assertEqual(
+            [(event["phase"], event.get("task")) for event in events],
+            [
+                ("planning", None),
+                ("planned", None),
+                ("worker_start", "做A"),
+                ("worker_done", "做A"),
+                ("worker_start", "做B"),
+                ("worker_done", "做B"),
+                ("reviewing", None),
+            ],
+        )
+        self.assertEqual(events[1]["tasks"], ["做A", "做B"])
+        self.assertEqual(events[3]["status"], "completed")
+        self.assertIsNone(orchestrator._writer)
+
+    def test_orchestrate_progress_is_optional(self):
+        """没有流式上下文，或推送失败时，流水线仍返回最终答案"""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator
+
+        def llm():
+            plan = MagicMock(content="SUBTASK|1|做A|none\n")
+            worker = MagicMock(content="结果")
+            review = MagicMock(content="最终答案")
+            fake = MagicMock()
+            fake.ainvoke = AsyncMock(side_effect=[plan, worker, review])
+            return fake
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=llm()), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", side_effect=RuntimeError("no stream")):
+            orchestrator = MultiAgentOrchestrator()
+            result = asyncio.run(orchestrator.orchestrate("做一件事", "test"))
+        self.assertEqual(result.final_answer, "最终答案")
+
+        def boom(_event):
+            raise RuntimeError("stream closed")
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=llm()), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", return_value=boom):
+            orchestrator = MultiAgentOrchestrator()
+            result = asyncio.run(orchestrator.orchestrate("做一件事", "test"))
+        self.assertEqual(result.final_answer, "最终答案")
+
+    def test_plan_failure_emits_progress(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator
+
+        fake_llm = MagicMock()
+        fake_llm.ainvoke = AsyncMock(return_value=MagicMock(content="我不会拆"))
+        events = []
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=fake_llm), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", return_value=events.append):
+            orchestrator = MultiAgentOrchestrator()
+            result = asyncio.run(orchestrator.orchestrate("做一件事", "test"))
+
+        self.assertEqual([event["phase"] for event in events], ["planning", "plan_failed"])
+        self.assertIn("任务拆解失败", result.final_answer)
+
+    def test_skipped_and_deadlock_emit_progress(self):
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator, SubTask, TaskStatus
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=MagicMock()):
+            orchestrator = MultiAgentOrchestrator()
+        events = []
+        orchestrator._writer = events.append
+
+        root = SubTask(description="调研")
+        child = SubTask(description="建议", depends_on=[root.id])
+
+        async def fake_execute(task, task_map, thread_id):
+            task.status = TaskStatus.FAILED
+            task.result = "boom"
+
+        orchestrator._execute_single = fake_execute
+        asyncio.run(orchestrator._execute_dag([root, child], "test"))
+        self.assertEqual(
+            [(event["phase"], event["task"], event.get("status")) for event in events],
+            [
+                ("worker_start", "调研", None),
+                ("worker_done", "调研", "failed"),
+                ("worker_skipped", "建议", "failed"),
+            ],
+        )
+
+        events.clear()
+        left = SubTask(description="做A")
+        right = SubTask(description="做B")
+        left.depends_on = [right.id]
+        right.depends_on = [left.id]
+        asyncio.run(orchestrator._execute_dag([left, right], "test"))
+        self.assertEqual(
+            [(event["phase"], event["task"]) for event in events],
+            [("deadlock", "做A"), ("deadlock", "做B")],
+        )
+
+    def test_format_orchestration_progress(self):
+        from entry.main import format_orchestration_progress
+
+        lines, status = format_orchestration_progress({"phase": "planning"})
+        self.assertIn("正在拆解任务", lines[0])
+        self.assertEqual(status, "Planner 正在拆解任务...")
+
+        lines, status = format_orchestration_progress({"phase": "planned", "tasks": ["做A", "做B"]})
+        self.assertEqual(len(lines), 3)
+        self.assertIn("做A", lines[1])
+        self.assertEqual(status, "Workers 执行中...")
+
+        lines, status = format_orchestration_progress(
+            {"phase": "worker_done", "task": "做A", "status": "failed"}
+        )
+        self.assertIn("失败", lines[0])
+        self.assertIn("失败", status)
+
+        lines, status = format_orchestration_progress({"phase": "reviewing"})
+        self.assertIn("Reviewer", lines[0])
+        self.assertIn("合并", status)
+        self.assertEqual(format_orchestration_progress({"token": "hi"}), ([], ""))
+
     def test_multi_agent_tool_registered(self):
         """测试多Agent协作工具已注册到内置工具列表"""
         from nexusagent.core.tools.builtins import BUILTIN_TOOLS
@@ -370,6 +629,62 @@ class TestMultiAgentOrchestrator(unittest.TestCase):
         tool_names = [t.name for t in BUILTIN_TOOLS]
         self.assertIn("multi_agent_collaborate", tool_names)
         self.assertEqual(tool_names[0], "multi_agent_collaborate")
+
+    def test_bound_tool_uses_main_agent_model(self):
+        """协作工具使用绑定时传入的模型，不跟环境变量走"""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from nexusagent.core.multi_agent import OrchestrationResult
+        from nexusagent.core.tools.multi_agent_tools import bind_multi_agent_collaborate
+
+        tool = bind_multi_agent_collaborate("aliyun", "glm-5")
+        self.assertEqual(tool.name, "multi_agent_collaborate")
+        self.assertEqual(tool.metadata["provider_name"], "aliyun")
+        self.assertEqual(tool.metadata["model_name"], "glm-5")
+
+        fake = OrchestrationResult(
+            task_id="t",
+            subtasks=[],
+            final_answer="选型建议",
+            total_time=0.2,
+            success_rate=100.0,
+            subtask_count=0,
+        )
+        with patch.dict(os.environ, {"DEFAULT_PROVIDER": "openai", "DEFAULT_MODEL": "gpt-4o-mini"}):
+            with patch("nexusagent.core.multi_agent.MultiAgentOrchestrator") as cls:
+                cls.return_value.orchestrate = AsyncMock(return_value=fake)
+                text = asyncio.run(tool.ainvoke({"task": "对比两个框架并给出建议"}))
+
+        cls.assert_called_once_with(
+            provider_name="aliyun",
+            model_name="glm-5",
+            max_concurrent_workers=3,
+        )
+        self.assertIn("选型建议", text)
+
+    def test_agent_app_binds_main_model_onto_collaborate_tool(self):
+        """主 Agent 创建时，协作工具继承当时的 provider 和 model"""
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.agent import create_agent_app
+
+        llm = MagicMock()
+        llm.bind_tools.return_value = llm
+        with patch("nexusagent.core.agent.get_provider", return_value=llm), \
+             patch("nexusagent.core.agent.load_dynamic_skills", return_value=[]):
+            app = create_agent_app(provider_name="aliyun", model_name="qwen-max")
+
+        tool = _collaborate_tool(app)
+        self.assertEqual(tool.metadata["provider_name"], "aliyun")
+        self.assertEqual(tool.metadata["model_name"], "qwen-max")
+
+
+def _collaborate_tool(app):
+    node = app.nodes["tools"]
+    for obj in (node, getattr(node, "bound", None), getattr(node, "runnable", None)):
+        tools = getattr(obj, "_tools_by_name", None)
+        if tools and "multi_agent_collaborate" in tools:
+            return tools["multi_agent_collaborate"]
+    raise AssertionError("图里没有 multi_agent_collaborate")
 
 class TestIntegration(unittest.TestCase):
     """集成测试：确保各模块可以正确导入和互操作"""

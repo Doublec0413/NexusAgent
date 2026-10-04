@@ -187,6 +187,41 @@ async def print_agent_report(content: str):
     await run_in_terminal(do_write, in_executor=False)
 
 
+def format_orchestration_progress(event: dict) -> tuple[list[str], str]:
+    """把编排进度事件格式化成主界面行和底部状态栏文案。"""
+    phase = event.get("phase") or ""
+    task = event.get("task") if isinstance(event.get("task"), str) else ""
+    short = task if len(task) <= 36 else task[:35] + "…"
+    label = "\033[38;5;51m"
+
+    def line(head: str, body: str) -> str:
+        return f"  ●{label} {head}\033[0m {TEXT}{body}\033[0m"
+
+    if phase == "planning":
+        return [line("Planner", "正在拆解任务...")], "Planner 正在拆解任务..."
+    if phase == "planned":
+        tasks = event.get("tasks") if isinstance(event.get("tasks"), list) else []
+        tasks = [item for item in tasks if isinstance(item, str) and item]
+        lines = [line("Planner", f"拆出 {len(tasks)} 个子任务")]
+        for index, desc in enumerate(tasks, 1):
+            lines.append(f"    {TEXT}{index}. {desc}\033[0m")
+        return lines, "Workers 执行中..."
+    if phase == "plan_failed":
+        return [line("Planner", "任务拆解失败")], "任务拆解失败"
+    if phase == "worker_start":
+        return [line("Worker", f"开始 · {task}")], f"Worker 执行中 : {short}"
+    if phase == "worker_done":
+        verb = "失败" if event.get("status") == "failed" else "完成"
+        return [line("Worker", f"{verb} · {task}")], f"Worker {verb} : {short}"
+    if phase == "worker_skipped":
+        return [line("Worker", f"跳过 · {task}")], f"Worker 跳过 : {short}"
+    if phase == "deadlock":
+        return [line("Worker", f"依赖死锁 · {task}")], f"依赖死锁 : {short}"
+    if phase == "reviewing":
+        return [line("Reviewer", "正在合并结果...")], "Reviewer 正在合并结果..."
+    return [], ""
+
+
 async def async_main():
     print_banner()
     
@@ -274,6 +309,18 @@ async def async_main():
                         inputs, config=config, stream_mode=["updates", "custom"]
                     ):
                         if mode == "custom":
+                            if event.get("phase"):
+                                if live.active:
+                                    await live.finish()
+                                    live = LiveStreamSession()
+                                lines, status = format_orchestration_progress(event)
+                                if status:
+                                    spinner.is_spinning = True
+                                    spinner.is_tool_calling = True
+                                    spinner.tool_msg = status
+                                for text in lines:
+                                    cprint(text)
+                                continue
                             token = event.get("token", "")
                             if token:
                                 spinner.is_spinning = False

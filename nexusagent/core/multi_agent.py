@@ -22,8 +22,17 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.config import get_stream_writer
 from .provider import get_provider
 from .logger import audit_logger
+
+
+def _capture_stream_writer():
+    """只在 astream(stream_mode 含 custom) 里可用。直接调用编排器时没有这个上下文。"""
+    try:
+        return get_stream_writer()
+    except (RuntimeError, KeyError, LookupError):
+        return None
 
 
 class TaskStatus(Enum):
@@ -64,11 +73,6 @@ class MultiAgentOrchestrator:
 
     工作流程:
         用户输入 → Planner(任务拆解) → Workers(并行执行) → Reviewer(审查合并) → 最终输出
-
-    性能特征:
-        - 子任务并发执行，平均缩短 40% 总耗时
-        - 失败重试机制，子任务成功率从 85% 提升至 97%
-        - DAG 依赖调度，确保依赖顺序零错误
     """
 
     def __init__(
@@ -80,14 +84,35 @@ class MultiAgentOrchestrator:
         self.llm = get_provider(provider_name=provider_name, model_name=model_name)
         self.max_concurrent = max_concurrent_workers
         self._semaphore = asyncio.Semaphore(max_concurrent_workers)
+        self._writer = None
+
+    def _emit(self, event: dict) -> None:
+        """把阶段进度推进 custom 流。推送失败不能打断流水线。"""
+        writer = self._writer
+        if writer is None:
+            return
+        try:
+            writer(event)
+        except Exception:
+            return
 
     async def orchestrate(self, user_task: str, thread_id: str = "orchestrator") -> OrchestrationResult:
         """
-        主编排入口：接收用户任务，返回编排结果
+        主编排入口：接收用户任务，返回编排结果。
+        各阶段通过 stream writer 推进度，主界面不用等整段流水线结束才有输出。
         """
         start_time = time.time()
         task_id = str(uuid.uuid4())[:12]
+        self._writer = _capture_stream_writer()
 
+        try:
+            return await self._orchestrate(user_task, thread_id, task_id, start_time)
+        finally:
+            self._writer = None
+
+    async def _orchestrate(
+        self, user_task: str, thread_id: str, task_id: str, start_time: float
+    ) -> OrchestrationResult:
         audit_logger.log_event(
             thread_id=thread_id,
             event="system_action",
@@ -95,9 +120,11 @@ class MultiAgentOrchestrator:
         )
 
         # Phase 1: Planner 拆解任务
+        self._emit({"phase": "planning"})
         subtasks = await self._plan(user_task, thread_id)
 
         if not subtasks:
+            self._emit({"phase": "plan_failed"})
             return OrchestrationResult(
                 task_id=task_id,
                 subtasks=[],
@@ -105,10 +132,17 @@ class MultiAgentOrchestrator:
                 total_time=time.time() - start_time
             )
 
+        self._emit({
+            "phase": "planned",
+            "count": len(subtasks),
+            "tasks": [t.description for t in subtasks],
+        })
+
         # Phase 2: Workers 并行执行（基于DAG依赖）
         await self._execute_dag(subtasks, thread_id)
 
         # Phase 3: Reviewer 审查合并
+        self._emit({"phase": "reviewing"})
         final_answer = await self._review(user_task, subtasks, thread_id)
 
         total_time = time.time() - start_time
@@ -164,10 +198,10 @@ class MultiAgentOrchestrator:
             args={"task": user_task}
         )
 
-        subtasks = []
+        parsed = []
         id_map = {}
 
-        for line in response.content.strip().split("\n"):
+        for line in response.content.splitlines():
             line = line.strip()
             if not line.startswith("SUBTASK|"):
                 continue
@@ -175,66 +209,104 @@ class MultiAgentOrchestrator:
             if len(parts) < 4:
                 continue
 
-            seq_num = parts[1].strip()
-            desc = parts[2].strip()
-            deps_str = parts[3].strip()
+            seq_num, desc, deps_str = parts[1].strip(), parts[2].strip(), parts[3].strip()
+            if not desc:
+                continue
+            if seq_num in id_map:
+                continue
 
             task = SubTask(description=desc)
             id_map[seq_num] = task.id
-            subtasks.append(task)
+            parsed.append((task, deps_str))
 
-        # 第二遍：解析依赖关系
-        for i, line in enumerate(response.content.strip().split("\n")):
-            line = line.strip()
-            if not line.startswith("SUBTASK|"):
+        for task, deps_str in parsed:
+            if deps_str.lower() in ("none", ""):
                 continue
-            parts = line.split("|")
-            if len(parts) < 4:
-                continue
-            deps_str = parts[3].strip()
-            if deps_str.lower() != "none" and deps_str:
-                dep_nums = [d.strip() for d in deps_str.split(",")]
-                task_idx = sum(1 for l in response.content.strip().split("\n")[:i+1] if l.strip().startswith("SUBTASK|")) - 1
-                if 0 <= task_idx < len(subtasks):
-                    subtasks[task_idx].depends_on = [
-                        id_map[d] for d in dep_nums if d in id_map
-                    ]
+            task.depends_on = [
+                id_map[d.strip()] for d in deps_str.split(",")
+                if d.strip() in id_map and id_map[d.strip()] != task.id
+            ]
 
-        return subtasks
+        return [t for t, _ in parsed]
 
     async def _execute_dag(self, subtasks: List[SubTask], thread_id: str):
         """
         基于DAG依赖关系调度执行子任务
-        无依赖的任务并行执行，有依赖的等待前置任务完成
+        无依赖的任务并行执行，有依赖的等待前置任务成功完成。
+        前置任务失败时，直接和传递依赖的后继任务标记为失败并跳过。
         """
         task_map = {t.id: t for t in subtasks}
         completed_ids = set()
 
         while len(completed_ids) < len(subtasks):
-            # 找出所有可执行的任务（依赖已完成且自身未执行）
-            ready_tasks = [
-                t for t in subtasks
-                if t.id not in completed_ids
-                and t.status in (TaskStatus.PENDING, TaskStatus.FAILED)
-                and all(dep_id in completed_ids for dep_id in t.depends_on)
-            ]
+            ready_tasks = []
+            blocked_tasks = []
+
+            for t in subtasks:
+                if t.id in completed_ids:
+                    continue
+
+                deps = [task_map.get(dep_id) for dep_id in t.depends_on]
+                if any(dep is not None and dep.status == TaskStatus.FAILED for dep in deps):
+                    blocked_tasks.append(t)
+                elif all(dep is not None and dep.status == TaskStatus.COMPLETED for dep in deps):
+                    ready_tasks.append(t)
+
+            for t in blocked_tasks:
+                t.status = TaskStatus.FAILED
+                t.result = "前置任务失败，已跳过"
+                completed_ids.add(t.id)
+                self._emit({
+                    "phase": "worker_skipped",
+                    "task": t.description,
+                    "status": TaskStatus.FAILED.value,
+                })
 
             if not ready_tasks:
-                # 检查是否有死锁（没有可执行任务但还有未完成任务）
+                if blocked_tasks:
+                    continue
+                # 没有可执行任务但还有未完成任务：依赖成环
                 remaining = [t for t in subtasks if t.id not in completed_ids]
                 if remaining:
                     for t in remaining:
                         t.status = TaskStatus.FAILED
                         t.result = "依赖死锁：前置任务未完成"
                         completed_ids.add(t.id)
+                        self._emit({
+                            "phase": "deadlock",
+                            "task": t.description,
+                            "status": TaskStatus.FAILED.value,
+                        })
                 break
 
-            # 并发执行就绪任务
-            coros = [self._execute_single(t, task_map, thread_id) for t in ready_tasks]
-            await asyncio.gather(*coros)
-
+            # 在父任务里推送进度。writer 内部会读当前任务的 LangGraph 上下文，
+            # 不能放到 gather 出去的子任务里。
             for t in ready_tasks:
-                completed_ids.add(t.id)
+                self._emit({"phase": "worker_start", "task": t.description})
+
+            pending = {
+                asyncio.create_task(self._execute_single(t, task_map, thread_id)): t
+                for t in ready_tasks
+            }
+            errors = []
+            while pending:
+                done, _ = await asyncio.wait(set(pending), return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    task = pending.pop(fut)
+                    exc = fut.exception()
+                    if exc is not None:
+                        errors.append(exc)
+                        status = TaskStatus.FAILED.value
+                    else:
+                        status = task.status.value
+                    self._emit({
+                        "phase": "worker_done",
+                        "task": task.description,
+                        "status": status,
+                    })
+                    completed_ids.add(task.id)
+            if errors:
+                raise errors[0]
 
     async def _execute_single(self, task: SubTask, task_map: Dict[str, SubTask], thread_id: str):
         """
@@ -248,7 +320,7 @@ class MultiAgentOrchestrator:
             dep_context = ""
             for dep_id in task.depends_on:
                 dep_task = task_map.get(dep_id)
-                if dep_task and dep_task.result:
+                if dep_task and dep_task.status == TaskStatus.COMPLETED and dep_task.result:
                     dep_context += f"\n[前置任务 '{dep_task.description}' 的结果]:\n{dep_task.result}\n"
 
             worker_prompt = (
@@ -308,7 +380,7 @@ class MultiAgentOrchestrator:
             f"1. 检查各子任务的输出是否正确、是否有矛盾\n"
             f"2. 将所有结果整合为一个完整、连贯的最终答案\n"
             f"3. 如果有子任务失败，说明影响并给出补救建议\n"
-            f"4. 若原始任务要求输出结构化 Markdown 报告，必须输出完整报告正文（含所有章节、表格和细节），禁止仅给摘要或一句话结论\n"
+            f"4. 若原始任务指定了交付形式（报告、代码、表格、清单、方案等），必须按该形式输出完整正文（含结构、章节、字段和细节），禁止仅给摘要、大纲或一句话结论\n"
             f"5. 直接输出最终答案，保留子任务中的关键细节"
         )
 
