@@ -18,6 +18,9 @@ from nexusagent.core.config import DB_PATH
 from nexusagent.core.bus import task_queue, purge_cancelled_heartbeats, is_cancelled_heartbeat
 from nexusagent.core.heartbeat import pacemaker_loop
 
+# 256 色 232–255 是灰阶，最亮的 255 也只有 #eeeeee，黑底上仍发灰。
+TEXT = "\033[38;2;255;255;255m"
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
@@ -32,11 +35,9 @@ def print_banner():
 
     CYAN = '\033[38;5;51m'
     PURPLE = '\033[38;5;141m'
-    SILVER = '\033[38;5;250m'
-    DIM = '\033[2m'
     BOLD = '\033[1m'
     RESET = '\033[0m'
-    WHITE = '\033[37m'
+    WHITE = TEXT
 
     logo = f"""{CYAN}{BOLD}
                               {PURPLE}🔮{RESET}{CYAN}{BOLD}
@@ -63,11 +64,11 @@ def print_banner():
         "Hello, World."
     ]
     quote = random.choice(quotes)
-    meta = f" {SILVER}✦{RESET} {CYAN}{quote}{RESET}"
+    meta = f" {WHITE}✦{RESET} {CYAN}{quote}{RESET}"
 
     tip = (
         f"{PURPLE} ✦ {RESET}"
-        f"{SILVER}{PURPLE}{BOLD}NexusAgent{RESET} 已完成启动。输入命令开始，输入 {PURPLE}/exit{RESET}{SILVER} 退出。{RESET}\n"
+        f"{WHITE}{PURPLE}{BOLD}NexusAgent{RESET}{WHITE} 已完成启动。输入命令开始，输入 {PURPLE}/exit{RESET}{WHITE} 退出。{RESET}\n"
     )
 
     print(logo)
@@ -85,7 +86,7 @@ def cprint(text="", end="\n"):
 
 def _format_agent_reply(content: str) -> str:
     lines = content.split("\n")
-    formatted = f"  \033[38;5;141m❯\033[0m \033[38;5;250m{lines[0]}"
+    formatted = f"  \033[38;5;141m❯\033[0m {TEXT}{lines[0]}"
     for line in lines[1:]:
         formatted += f"\n    {line}"
     return formatted + "\033[0m"
@@ -131,7 +132,7 @@ class LiveStreamSession:
     async def _display_loop(self):
         def blocking():
             out = sys.__stdout__
-            out.write("  \033[38;5;141m❯\033[0m \033[38;5;250m")
+            out.write(f"  \033[38;5;141m❯\033[0m {TEXT}")
             out.flush()
             indent_next = False
             while True:
@@ -240,10 +241,10 @@ async def async_main():
             frame = spinner.frames[idx_frame]
             
 
-            return ANSI(f"  \033[38;5;51m{frame}\033[0m \033[38;5;250m{display_msg}\033[0m \033[38;5;141m[{elapsed:.1f}s]\033[0m")
+            return ANSI(f"  \033[38;5;51m{frame}\033[0m {TEXT}{display_msg}\033[0m \033[38;5;141m[{elapsed:.1f}s]\033[0m")
 
         prompt_message = ANSI("  \033[38;5;51m❯\033[0m ")
-        placeholder_text = ANSI("\033[3m\033[38;5;242minput...\033[0m")
+        placeholder_text = ANSI(f"\033[3m{TEXT}input...\033[0m")
 
         async def agent_worker():
             while True:
@@ -341,7 +342,8 @@ async def async_main():
 
         async def user_input_loop():
             custom_style = Style.from_dict({
-                'bottom-toolbar': 'bg:default fg:default noreverse',
+                '': '#ffffff',
+                'bottom-toolbar': 'bg:default #ffffff noreverse',
             })
             
             session = PromptSession(
@@ -372,7 +374,7 @@ async def async_main():
                     
 
                     padded_bubble = f"  ❯ {user_input}    "
-                    cprint(f"\033[48;2;38;38;38m\033[38;5;255m{padded_bubble}\033[0m\n")
+                    cprint(f"\033[48;2;38;38;38m{TEXT}{padded_bubble}\033[0m\n")
                     
                     await task_queue.put(user_input)
                     if user_input.lower() in ["/exit", "/quit"]:

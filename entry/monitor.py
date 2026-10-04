@@ -14,11 +14,11 @@ cyber_theme = Theme({
     "info": "dim cyan",
     "warning": "color(141)",
     "error": "bold red",
-    "llm_input": "dim white",
+    "llm_input": "white",
     "tool_call": "bold yellow",
     "tool_result": "bold green",
     "ai_message": "bold bright_magenta",
-    "timestamp": "dim white"
+    "timestamp": "color(252)"
 })
 
 console = Console(theme=cyber_theme)
@@ -41,7 +41,7 @@ def print_header():
     content = Text(justify="center")
     content.append("\n  Live Stream  \n\n", style="bold white italic")
     content.append(icon + "\n\n", style="color(141)")
-    content.append("   What is NexusAgent doing?    \n", style="dim white italic") 
+    content.append("   What is NexusAgent doing?    \n", style="white italic") 
 
     panel = Panel(
         Align.center(content),  
