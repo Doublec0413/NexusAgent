@@ -27,6 +27,8 @@ async def _run_collaboration(task: str, provider_name: str, model_name: str) -> 
         max_concurrent_workers=3,
     )
     result = await orchestrator.orchestrate(task, thread_id="local_geek_master")
+    if result.timed_out:
+        return result.final_answer
 
     lines = [
         f"多Agent协作完成 | 子任务: {result.subtask_count} | "

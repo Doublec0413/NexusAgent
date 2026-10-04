@@ -27,12 +27,29 @@ from .provider import get_provider
 from .logger import audit_logger
 
 
+# 整段流水线的上限，以及单次模型调用的上限。
+PIPELINE_TIMEOUT = 300
+CALL_TIMEOUT = 60
+
+
 def _capture_stream_writer():
     """只在 astream(stream_mode 含 custom) 里可用。直接调用编排器时没有这个上下文。"""
     try:
         return get_stream_writer()
     except (RuntimeError, KeyError, LookupError):
         return None
+
+
+def _timeout_label(seconds: float) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{int(seconds // 60)}分钟"
+    if seconds >= 10:
+        return f"{int(seconds)}秒"
+    return f"{seconds:g}秒"
+
+
+class ModelCallTimeout(Exception):
+    """单次模型调用超过 call_timeout。不要继承 TimeoutError，避免和流水线总超时混在一起。"""
 
 
 class TaskStatus(Enum):
@@ -65,6 +82,7 @@ class OrchestrationResult:
     total_time: float = 0.0
     success_rate: float = 0.0
     subtask_count: int = 0
+    timed_out: bool = False
 
 
 class MultiAgentOrchestrator:
@@ -80,11 +98,16 @@ class MultiAgentOrchestrator:
         provider_name: str = "openai",
         model_name: str = "gpt-4o-mini",
         max_concurrent_workers: int = 3,
+        total_timeout: float = PIPELINE_TIMEOUT,
+        call_timeout: float = CALL_TIMEOUT,
     ):
         self.llm = get_provider(provider_name=provider_name, model_name=model_name)
         self.max_concurrent = max_concurrent_workers
+        self.total_timeout = total_timeout
+        self.call_timeout = call_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent_workers)
         self._writer = None
+        self._inflight: set[asyncio.Task] = set()
 
     def _emit(self, event: dict) -> None:
         """把阶段进度推进 custom 流。推送失败不能打断流水线。"""
@@ -96,6 +119,51 @@ class MultiAgentOrchestrator:
         except Exception:
             return
 
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        return task
+
+    async def _cancel_inflight(self) -> None:
+        pending = [task for task in list(self._inflight) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=1)
+
+    async def _ainvoke(self, messages):
+        try:
+            return await asyncio.wait_for(
+                self.llm.ainvoke(messages),
+                timeout=self.call_timeout,
+            )
+        except TimeoutError:
+            raise ModelCallTimeout(
+                f"模型调用超时（{_timeout_label(self.call_timeout)}）"
+            ) from None
+
+    def _result(
+        self,
+        task_id: str,
+        subtasks: List[SubTask],
+        final_answer: str,
+        start_time: float,
+        timed_out: bool = False,
+    ) -> OrchestrationResult:
+        total_time = time.time() - start_time
+        completed_count = sum(1 for task in subtasks if task.status == TaskStatus.COMPLETED)
+        success_rate = (completed_count / len(subtasks) * 100) if subtasks else 0
+        return OrchestrationResult(
+            task_id=task_id,
+            subtasks=subtasks,
+            final_answer=final_answer,
+            total_time=total_time,
+            success_rate=success_rate,
+            subtask_count=len(subtasks),
+            timed_out=timed_out,
+        )
+
     async def orchestrate(self, user_task: str, thread_id: str = "orchestrator") -> OrchestrationResult:
         """
         主编排入口：接收用户任务，返回编排结果。
@@ -106,7 +174,26 @@ class MultiAgentOrchestrator:
         self._writer = _capture_stream_writer()
 
         try:
-            return await self._orchestrate(user_task, thread_id, task_id, start_time)
+            return await asyncio.wait_for(
+                self._orchestrate(user_task, thread_id, task_id, start_time),
+                timeout=self.total_timeout,
+            )
+        except TimeoutError:
+            await self._cancel_inflight()
+            label = _timeout_label(self.total_timeout)
+            self._emit({"phase": "timeout", "limit": label})
+            audit_logger.log_event(
+                thread_id=thread_id,
+                event="system_action",
+                content=f"多Agent编排超时 | Task: {task_id} | 上限: {label}"
+            )
+            return self._result(
+                task_id,
+                [],
+                f"多Agent流水线超时（{label}），请简化任务后重试。",
+                start_time,
+                timed_out=True,
+            )
         finally:
             self._writer = None
 
@@ -121,7 +208,11 @@ class MultiAgentOrchestrator:
 
         # Phase 1: Planner 拆解任务
         self._emit({"phase": "planning"})
-        subtasks = await self._plan(user_task, thread_id)
+        try:
+            subtasks = await self._plan(user_task, thread_id)
+        except ModelCallTimeout as exc:
+            self._emit({"phase": "plan_failed"})
+            return self._result(task_id, [], str(exc), start_time)
 
         if not subtasks:
             self._emit({"phase": "plan_failed"})
@@ -143,25 +234,23 @@ class MultiAgentOrchestrator:
 
         # Phase 3: Reviewer 审查合并
         self._emit({"phase": "reviewing"})
-        final_answer = await self._review(user_task, subtasks, thread_id)
+        try:
+            final_answer = await self._review(user_task, subtasks, thread_id)
+        except ModelCallTimeout as exc:
+            lines = [str(exc), ""]
+            for task in subtasks:
+                lines.append(f"- {task.description} [{task.status.value}] {task.result}")
+            final_answer = "\n".join(lines)
 
-        total_time = time.time() - start_time
-        completed_count = sum(1 for t in subtasks if t.status == TaskStatus.COMPLETED)
-        success_rate = (completed_count / len(subtasks) * 100) if subtasks else 0
-
-        result = OrchestrationResult(
-            task_id=task_id,
-            subtasks=subtasks,
-            final_answer=final_answer,
-            total_time=total_time,
-            success_rate=success_rate,
-            subtask_count=len(subtasks)
-        )
+        result = self._result(task_id, subtasks, final_answer, start_time)
 
         audit_logger.log_event(
             thread_id=thread_id,
             event="system_action",
-            content=f"多Agent编排完成 | 子任务: {len(subtasks)} | 成功率: {success_rate:.1f}% | 耗时: {total_time:.2f}s"
+            content=(
+                f"多Agent编排完成 | 子任务: {len(subtasks)} | "
+                f"成功率: {result.success_rate:.1f}% | 耗时: {result.total_time:.2f}s"
+            )
         )
 
         return result
@@ -189,7 +278,7 @@ class MultiAgentOrchestrator:
             "5. 只输出SUBTASK行，不要输出任何其他内容"
         ))
 
-        response = await self.llm.ainvoke([plan_prompt, HumanMessage(content=user_task)])
+        response = await self._ainvoke([plan_prompt, HumanMessage(content=user_task)])
 
         audit_logger.log_event(
             thread_id=thread_id,
@@ -285,7 +374,7 @@ class MultiAgentOrchestrator:
                 self._emit({"phase": "worker_start", "task": t.description})
 
             pending = {
-                asyncio.create_task(self._execute_single(t, task_map, thread_id)): t
+                self._spawn(self._execute_single(t, task_map, thread_id)): t
                 for t in ready_tasks
             }
             errors = []
@@ -293,6 +382,8 @@ class MultiAgentOrchestrator:
                 done, _ = await asyncio.wait(set(pending), return_when=asyncio.FIRST_COMPLETED)
                 for fut in done:
                     task = pending.pop(fut)
+                    if fut.cancelled():
+                        raise asyncio.CancelledError()
                     exc = fut.exception()
                     if exc is not None:
                         errors.append(exc)
@@ -339,7 +430,7 @@ class MultiAgentOrchestrator:
 
             for attempt in range(task.max_retries + 1):
                 try:
-                    response = await self.llm.ainvoke([HumanMessage(content=worker_prompt)])
+                    response = await self._ainvoke([HumanMessage(content=worker_prompt)])
                     task.result = response.content
                     task.status = TaskStatus.COMPLETED
                     task.execution_time = time.time() - start
@@ -384,7 +475,7 @@ class MultiAgentOrchestrator:
             f"5. 直接输出最终答案，保留子任务中的关键细节"
         )
 
-        response = await self.llm.ainvoke([HumanMessage(content=review_prompt)])
+        response = await self._ainvoke([HumanMessage(content=review_prompt)])
 
         audit_logger.log_event(
             thread_id=thread_id,

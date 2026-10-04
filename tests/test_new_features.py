@@ -560,6 +560,94 @@ SUBTASK|3|做C|1,3,9
         self.assertEqual([event["phase"] for event in events], ["planning", "plan_failed"])
         self.assertIn("任务拆解失败", result.final_answer)
 
+    def test_pipeline_timeout_cancels_running_worker(self):
+        """整段流水线到点就停，并取消还在跑的 Worker"""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator
+
+        cancelled = []
+
+        async def fake_ainvoke(messages):
+            first = messages[0].content
+            if "任务规划专家" in first:
+                return MagicMock(content="SUBTASK|1|做A|none\n")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return MagicMock(content="不会走到")
+
+        fake_llm = MagicMock()
+        fake_llm.ainvoke = fake_ainvoke
+        events = []
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=fake_llm), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", return_value=events.append):
+            orchestrator = MultiAgentOrchestrator(total_timeout=0.15, call_timeout=30)
+            started = time.time()
+            result = asyncio.run(orchestrator.orchestrate("对比两个框架", "test"))
+
+        self.assertLess(time.time() - started, 2)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.final_answer, "多Agent流水线超时（0.15秒），请简化任务后重试。")
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(events[-1]["phase"], "timeout")
+        self.assertEqual(orchestrator._inflight, set())
+
+    def test_call_timeout_retries_then_review_continues(self):
+        """单次调用超时只让该子任务失败，流水线继续做审查"""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+        from nexusagent.core.multi_agent import MultiAgentOrchestrator, TaskStatus
+
+        calls = {"n": 0}
+
+        async def fake_ainvoke(messages):
+            calls["n"] += 1
+            first = messages[0].content
+            if "任务规划专家" in first:
+                return MagicMock(content="SUBTASK|1|做A|none\n")
+            if "审查专家" in first:
+                return MagicMock(content="汇总")
+            await asyncio.sleep(1)
+            return MagicMock(content="不会走到")
+
+        fake_llm = MagicMock()
+        fake_llm.ainvoke = fake_ainvoke
+
+        with patch("nexusagent.core.multi_agent.get_provider", return_value=fake_llm), \
+             patch("nexusagent.core.multi_agent.get_stream_writer", return_value=lambda _event: None):
+            orchestrator = MultiAgentOrchestrator(total_timeout=5, call_timeout=0.05)
+            result = asyncio.run(orchestrator.orchestrate("做一件事", "test"))
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.final_answer, "汇总")
+        self.assertEqual(result.subtasks[0].status, TaskStatus.FAILED)
+        self.assertIn("模型调用超时（0.05秒）", result.subtasks[0].result)
+        self.assertEqual(calls["n"], 5)
+
+    def test_tool_returns_timeout_message_directly(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from nexusagent.core.multi_agent import OrchestrationResult
+        from nexusagent.core.tools.multi_agent_tools import bind_multi_agent_collaborate
+
+        tool = bind_multi_agent_collaborate("aliyun", "glm-5")
+        fake = OrchestrationResult(
+            task_id="t",
+            subtasks=[],
+            final_answer="多Agent流水线超时（5分钟），请简化任务后重试。",
+            total_time=300,
+            timed_out=True,
+        )
+        with patch("nexusagent.core.multi_agent.MultiAgentOrchestrator") as cls:
+            cls.return_value.orchestrate = AsyncMock(return_value=fake)
+            text = asyncio.run(tool.ainvoke({"task": "写一份很长的报告"}))
+
+        self.assertEqual(text, "多Agent流水线超时（5分钟），请简化任务后重试。")
+
     def test_skipped_and_deadlock_emit_progress(self):
         import asyncio
         from unittest.mock import MagicMock, patch
@@ -620,6 +708,9 @@ SUBTASK|3|做C|1,3,9
         lines, status = format_orchestration_progress({"phase": "reviewing"})
         self.assertIn("Reviewer", lines[0])
         self.assertIn("合并", status)
+        lines, status = format_orchestration_progress({"phase": "timeout", "limit": "5分钟"})
+        self.assertIn("5分钟", lines[0])
+        self.assertEqual(status, "流水线超时（5分钟）")
         self.assertEqual(format_orchestration_progress({"token": "hi"}), ([], ""))
 
     def test_multi_agent_tool_registered(self):

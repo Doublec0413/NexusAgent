@@ -219,6 +219,9 @@ def format_orchestration_progress(event: dict) -> tuple[list[str], str]:
         return [line("Worker", f"依赖死锁 · {task}")], f"依赖死锁 : {short}"
     if phase == "reviewing":
         return [line("Reviewer", "正在合并结果...")], "Reviewer 正在合并结果..."
+    if phase == "timeout":
+        limit = event.get("limit") if isinstance(event.get("limit"), str) and event.get("limit") else "5分钟"
+        return [line("Timeout", f"已超过 {limit}，流水线已停止")], f"流水线超时（{limit}）"
     return [], ""
 
 
