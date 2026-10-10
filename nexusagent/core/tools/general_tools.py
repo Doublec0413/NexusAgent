@@ -1,3 +1,6 @@
+import ast
+import math
+import operator
 import os
 from datetime import datetime
 
@@ -5,6 +8,50 @@ from .base import nexusagent_tool
 from ..config import MEMORY_DIR
 
 PROFILE_PATH = os.path.join(MEMORY_DIR, "user_profile.md")
+
+# 只放行算术运算符。属性访问、名字查找、函数调用都不在表里。
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+# 挡住 2 ** 999999999 这类整数乘方把 CPU 打满。
+_MAX_POW_EXPONENT = 1000
+
+
+def _safe_eval(node: ast.AST):
+    """白名单求值：只接受数字常量和 _OPS 里的运算符。"""
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    ):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+        left = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        if type(node.op) is ast.Pow and not _is_safe_exponent(right):
+            raise ValueError("指数超出允许范围")
+        return _OPS[type(node.op)](left, right)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_safe_eval(node.operand))
+    raise ValueError("不支持的表达式")
+
+
+def _is_safe_exponent(exponent) -> bool:
+    if isinstance(exponent, bool) or not isinstance(exponent, (int, float)):
+        return False
+    if isinstance(exponent, float) and not math.isfinite(exponent):
+        return False
+    return abs(exponent) <= _MAX_POW_EXPONENT
 
 
 @nexusagent_tool
@@ -57,10 +104,7 @@ def calculator(expression: str) -> str:
     注意：参数 expression 必须是一个合法的 Python 数学表达式字符串。
     """
     try:
-        # 警告: eval 在真实的生产环境中存在注入风险！
-        # 这里仅为了搭建核心层做快速 Demo。未来在生产级扩展中，
-        # 应该替换为基于 AST 的安全解析器，或者更专业的数学库（如 numexpr）。
-        result = eval(expression, {"__builtins__": {}}, {})
+        result = _safe_eval(ast.parse(expression, mode="eval"))
         return f"表达式 '{expression}' 的计算结果是: {result}"
     except Exception as e:
         return f"计算出错，请检查表达式格式。错误信息: {str(e)}"

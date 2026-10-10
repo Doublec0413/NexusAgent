@@ -10,18 +10,16 @@ SYS_OS = platform.system()
 
 def _get_safe_path(relative_path: str) -> str:
     """
-    将模型传入的相对路径转换为绝对路径，并死死检查它是否越界！
-    如果模型尝试传入 "../../etc/passwd"，这里会直接把它拦截。
+    将模型传入的相对路径解析为真实路径，并确认它落在 office 工位内。
+    ".." 和指向工位外的符号链接都会在这里被拦截。
     """
-    # 将 OFFICE_DIR 转化为标准绝对路径
-    base_dir = os.path.abspath(OFFICE_DIR)
-    # 将目标路径转化为绝对路径
-    target_path = os.path.abspath(os.path.join(base_dir, relative_path))
-    
-    # 核心防御：目标路径必须以 OFFICE_DIR 开头！
-    if not target_path.startswith(base_dir):
+    base_dir = os.path.realpath(OFFICE_DIR)
+    target_path = os.path.realpath(os.path.join(base_dir, relative_path))
+
+    # 必须等于工位本身，或紧跟路径分隔符。裸 startswith 会放行 office_secret。
+    if not (target_path == base_dir or target_path.startswith(base_dir + os.sep)):
         raise PermissionError(format_path_blocked(relative_path))
-    
+
     return target_path
 
 @nexusagent_tool

@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest.mock import patch, mock_open
 import os
@@ -25,7 +26,7 @@ class TestSandboxTools(unittest.TestCase):
         try:
             # 使用实际 OFFICE_DIR 测试
             result = _get_safe_path('subdir/file.txt')
-            expected = os.path.abspath(os.path.join(OFFICE_DIR, 'subdir/file.txt'))
+            expected = os.path.realpath(os.path.join(OFFICE_DIR, 'subdir/file.txt'))
             self.assertEqual(result, expected)
         finally:
             pass
@@ -34,6 +35,54 @@ class TestSandboxTools(unittest.TestCase):
         """测试路径遍历攻击"""
         with self.assertRaises(PermissionError):
             _get_safe_path('../../forbidden/file.txt')
+
+    def test_get_safe_path_rejects_sibling_prefix(self):
+        """office_secret 不能因为字符串前缀是 office 就被放行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            office = os.path.join(tmp, "office")
+            sibling = os.path.join(tmp, "office_secret")
+            os.makedirs(office)
+            os.makedirs(sibling)
+            with patch("nexusagent.core.tools.sandbox_tools.OFFICE_DIR", office):
+                with self.assertRaises(PermissionError):
+                    _get_safe_path(os.path.join("..", "office_secret", "key.txt"))
+
+    def test_get_safe_path_rejects_symlink_escape(self):
+        """指向工位外的符号链接必须被拦截。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            office = os.path.join(tmp, "office")
+            secret = os.path.join(tmp, "secret")
+            os.makedirs(office)
+            os.makedirs(secret)
+            os.symlink(secret, os.path.join(office, "link"))
+            with patch("nexusagent.core.tools.sandbox_tools.OFFICE_DIR", office):
+                with self.assertRaises(PermissionError):
+                    _get_safe_path(os.path.join("link", "passwd"))
+
+    def test_get_safe_path_allows_internal_symlink(self):
+        """解析后仍在工位内的符号链接可以访问。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            office = os.path.join(tmp, "office")
+            inner = os.path.join(office, "inner")
+            os.makedirs(inner)
+            os.symlink(inner, os.path.join(office, "alias"))
+            with patch("nexusagent.core.tools.sandbox_tools.OFFICE_DIR", office):
+                result = _get_safe_path(os.path.join("alias", "a.txt"))
+            self.assertEqual(result, os.path.realpath(os.path.join(inner, "a.txt")))
+
+    def test_is_outside_office_follows_symlink(self):
+        """意图检测也要按符号链接的真实路径判断越界。"""
+        from nexusagent.core.sandbox_protocol import _is_outside_office
+
+        with tempfile.TemporaryDirectory() as tmp:
+            office = os.path.join(tmp, "office")
+            secret = os.path.join(tmp, "secret")
+            os.makedirs(office)
+            os.makedirs(secret)
+            os.symlink(secret, os.path.join(office, "link"))
+            with patch("nexusagent.core.sandbox_protocol.OFFICE_DIR", office):
+                self.assertTrue(_is_outside_office(os.path.join("link", "passwd")))
+                self.assertFalse(_is_outside_office(os.path.join("notes", "a.txt")))
 
     @patch('nexusagent.core.tools.sandbox_tools.os.path.exists', return_value=True)
     @patch('nexusagent.core.tools.sandbox_tools.os.listdir', return_value=['file1.txt', 'subdir'])

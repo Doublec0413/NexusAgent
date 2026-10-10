@@ -76,22 +76,22 @@ def _normalize_path_candidate(raw: str) -> str:
 
 
 def _office_base_dir() -> str:
-    return os.path.abspath(OFFICE_DIR)
+    return os.path.realpath(OFFICE_DIR)
 
 
 def _is_outside_office(path_str: str) -> bool:
-    """判断路径是否落在 office 工位之外。"""
+    """判断路径是否落在 office 工位之外。符号链接会先解析到真实路径。"""
     path_str = _normalize_path_candidate(path_str)
     if not path_str or path_str == "/":
         return False
 
     base_dir = _office_base_dir()
     if os.path.isabs(path_str) or path_str.startswith(".."):
-        target = os.path.abspath(path_str if os.path.isabs(path_str) else os.path.join(base_dir, path_str))
+        target = os.path.realpath(path_str if os.path.isabs(path_str) else os.path.join(base_dir, path_str))
     elif path_str.startswith("nexusagent/") or path_str.startswith("workspace/"):
-        target = os.path.abspath(os.path.join(PROJECT_ROOT, path_str))
+        target = os.path.realpath(os.path.join(PROJECT_ROOT, path_str))
     else:
-        target = os.path.abspath(os.path.join(base_dir, path_str))
+        target = os.path.realpath(os.path.join(base_dir, path_str))
 
     return not (target == base_dir or target.startswith(base_dir + os.sep))
 
