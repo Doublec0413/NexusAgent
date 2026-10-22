@@ -13,22 +13,16 @@ from .config import MEMORY_DIR
 from .skill_loader import load_dynamic_skills
 from .security_scorer import security_scorer, is_blocked_tool_result
 from .sandbox_protocol import should_record_policy_violation
-from .rag_engine import RAGKnowledgeBase
+from .rag_engine import get_knowledge_base
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 import os
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import ANSI
 
-# 全局 RAG 知识库实例
-_rag_kb = None
-
 def get_rag_kb():
-    """懒加载单例，避免启动时加载向量索引。"""
-    global _rag_kb
-    if _rag_kb is None:
-        _rag_kb = RAGKnowledgeBase()
-    return _rag_kb
+    """第一次使用时读取已保存的词频和 IDF，并与知识库目录对齐。"""
+    return get_knowledge_base()
 
 
 def _stream_token_text(content) -> str:

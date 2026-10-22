@@ -8,7 +8,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from nexusagent.core.tools.builtins import (
+from nexusagent.core.tools import (
     get_current_time,
     calculator
 )
@@ -69,7 +69,7 @@ class TestBuiltInTools(unittest.TestCase):
     @patch('nexusagent.core.tools.general_tools.PROFILE_PATH', new_callable=lambda: tempfile.mktemp())
     def test_save_user_profile(self, mock_profile_path, mock_memory_dir):
         """测试保存用户档案功能"""
-        from nexusagent.core.tools.builtins import save_user_profile
+        from nexusagent.core.tools import save_user_profile
 
         import tempfile
         import os
@@ -106,7 +106,7 @@ class TestScheduledTasks(unittest.TestCase):
 
     def test_schedule_task_single(self):
         """测试单次任务调度功能"""
-        from nexusagent.core.tools.builtins import schedule_task, list_scheduled_tasks
+        from nexusagent.core.tools import schedule_task, list_scheduled_tasks
 
         future_time = (datetime.now().replace(hour=9, minute=0, second=0)
                       if datetime.now().hour >= 9 else
@@ -130,14 +130,14 @@ class TestScheduledTasks(unittest.TestCase):
 
     def test_schedule_task_invalid_time_format(self):
         """测试调度任务 - 无效时间格式"""
-        from nexusagent.core.tools.builtins import schedule_task
+        from nexusagent.core.tools import schedule_task
 
         result = schedule_task.invoke({"target_time": "invalid_time", "description": "测试任务"})
         self.assertIn("设定失败：时间格式错误", result)
 
     def test_list_scheduled_tasks_empty(self):
         """测试列出空任务列表"""
-        from nexusagent.core.tools.builtins import list_scheduled_tasks
+        from nexusagent.core.tools import list_scheduled_tasks
 
         # 确保文件为空
         with open(self.temp_file.name, 'w') as f:
@@ -149,7 +149,7 @@ class TestScheduledTasks(unittest.TestCase):
 
     def test_get_system_model_info(self):
         """测试获取系统模型信息功能"""
-        from nexusagent.core.tools.builtins import get_system_model_info
+        from nexusagent.core.tools import get_system_model_info
 
         # 保存原有环境变量
         orig_provider = os.environ.get('DEFAULT_PROVIDER')
@@ -234,7 +234,7 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
 
     def test_list_scheduled_tasks_non_empty(self):
         """测试列出非空任务列表"""
-        from nexusagent.core.tools.builtins import list_scheduled_tasks
+        from nexusagent.core.tools import list_scheduled_tasks
 
         result = list_scheduled_tasks.invoke({})
         self.assertIn("当前待执行任务列表", result)
@@ -243,7 +243,7 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
 
     def test_delete_scheduled_task(self):
         """测试删除计划任务"""
-        from nexusagent.core.tools.builtins import delete_scheduled_task, list_scheduled_tasks
+        from nexusagent.core.tools import delete_scheduled_task, list_scheduled_tasks
 
         result = delete_scheduled_task.invoke({"task_id": "task1"})
         self.assertIn("已成功取消", result)
@@ -255,14 +255,14 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
 
     def test_delete_nonexistent_task(self):
         """测试删除不存在的任务"""
-        from nexusagent.core.tools.builtins import delete_scheduled_task
+        from nexusagent.core.tools import delete_scheduled_task
 
         result = delete_scheduled_task.invoke({"task_id": "nonexistent"})
         self.assertIn("删除失败：未找到", result)
 
     def test_modify_scheduled_task(self):
         """测试修改计划任务"""
-        from nexusagent.core.tools.builtins import modify_scheduled_task, list_scheduled_tasks
+        from nexusagent.core.tools import modify_scheduled_task, list_scheduled_tasks
 
         new_time = (datetime.now().replace(hour=10, minute=0, second=0)
                    if datetime.now().hour >= 10 else
@@ -282,14 +282,14 @@ class TestScheduledTasksWithTasks(unittest.TestCase):
 
     def test_modify_scheduled_task_invalid_time(self):
         """测试修改计划任务 - 无效时间格式"""
-        from nexusagent.core.tools.builtins import modify_scheduled_task
+        from nexusagent.core.tools import modify_scheduled_task
 
         result = modify_scheduled_task.invoke({"task_id": "task1", "new_time": "invalid_time"})
         self.assertIn("修改失败：时间格式错误", result)
 
     def test_modify_nonexistent_task(self):
         """测试修改不存在的任务"""
-        from nexusagent.core.tools.builtins import modify_scheduled_task
+        from nexusagent.core.tools import modify_scheduled_task
 
         result = modify_scheduled_task.invoke({"task_id": "nonexistent", "new_description": "不存在的任务"})
         self.assertIn("修改失败：未找到", result)

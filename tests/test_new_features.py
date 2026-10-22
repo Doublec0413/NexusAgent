@@ -116,6 +116,132 @@ class TestRAGEngine(unittest.TestCase):
         self.assertIn("total_chunks", stats)
         self.assertIn("total_documents", stats)
 
+    def _write(self, name: str, content: str) -> str:
+        path = os.path.join(self.knowledge_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def test_directory_scan_indexes_existing_files(self):
+        """建库前放入的文件，不调用导入也能检索。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        self._write("auto.txt", "自动扫描可以找到量子纠缠的说明。")
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+
+        results = kb.search("量子纠缠", top_k=3)
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0].chunk.source_file, "auto.txt")
+
+    def test_reload_uses_saved_term_frequencies(self):
+        """重启后直接读出词频和 IDF，未改动文件的词频保持不变。"""
+        import json
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        self._write("a.txt", "苹果派的配方保持不变，面粉和黄油的比例不要改。")
+        self._write("b.txt", "香蕉昔的旧配方只有香蕉和牛奶。")
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        first = kb.search("苹果派", top_k=1)
+        self.assertGreater(len(first), 0)
+
+        with open(kb.index_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        tf_before = next(item["tf"] for item in saved["chunks"] if item["source_file"] == "a.txt")
+        self.assertIn("idf", saved)
+        self.assertNotIn("tfidf_vector", saved["chunks"][0])
+        self.assertEqual(saved["doc_count"], len(saved["chunks"]))
+
+        self._write("b.txt", "香蕉昔的新配方加入肉桂。")
+        reloaded = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        with open(reloaded.index_path, "r", encoding="utf-8") as f:
+            updated = json.load(f)
+        tf_after = next(item["tf"] for item in updated["chunks"] if item["source_file"] == "a.txt")
+        self.assertEqual(tf_before, tf_after)
+        self.assertTrue(any("肉桂" in chunk.content for chunk in reloaded.chunks))
+        self.assertTrue(all("旧配方" not in chunk.content for chunk in reloaded.chunks))
+        again = reloaded.search("苹果派", top_k=1)
+        self.assertGreater(len(again), 0)
+
+    def test_changed_file_replaces_old_chunks(self):
+        """同一路径内容变化后，只留下新切片。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        path = self._write("note.txt", "旧结论是火星有运河。")
+        RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self._write("note.txt", "新结论是火星有冰盖。")
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+
+        self.assertTrue(all("运河" not in chunk.content for chunk in kb.chunks))
+        self.assertTrue(any("冰盖" in chunk.content for chunk in kb.chunks))
+        self.assertEqual(kb.add_document(path), 0)
+
+    def test_deleted_file_drops_chunks(self):
+        """目录里删除的文件，下次建库时切片一并移除。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        path = self._write("gone.txt", "独有词苜蓿草只出现在这份文件。")
+        RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        os.remove(path)
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+
+        self.assertEqual(kb.chunks, [])
+        self.assertEqual(kb.search("苜蓿草"), [])
+
+    def test_same_content_different_paths_are_both_kept(self):
+        """去重按路径。两份相同正文都会留下。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        text = "两份相同正文都应该能被检索到。"
+        self._write("a.txt", text)
+        self._write("b.txt", text)
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+
+        self.assertEqual(set(kb._files), {"a.txt", "b.txt"})
+        self.assertEqual({chunk.source_file for chunk in kb.chunks}, {"a.txt", "b.txt"})
+
+    def test_legacy_fingerprint_file_is_rebuilt_from_disk(self):
+        """只有 MD5、没有切片的旧索引不会挡住重建。"""
+        import json
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        self._write("legacy.txt", "旧索引里没有正文，磁盘上的原文仍可检索。")
+        with open(os.path.join(self.knowledge_dir, "_index.json"), "w", encoding="utf-8") as f:
+            json.dump({"hashes": ["abc"], "chunk_count": 3}, f)
+
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self.assertTrue(any("旧索引" in chunk.content for chunk in kb.chunks))
+        self.assertNotIn("_index.json", {chunk.source_file for chunk in kb.chunks})
+
+    def test_nested_file_uses_relative_source(self):
+        """子目录文件用相对路径区分同名文件。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        self._write(os.path.join("sub", "a.txt"), "嵌套文档里的关键词是琥珀。")
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self.assertEqual(kb.chunks[0].source_file, "sub/a.txt")
+
+    def test_external_file_updates_and_disappears(self):
+        """目录外的文件按绝对路径更新；文件删除后切片也删除。"""
+        from nexusagent.core.rag_engine import RAGKnowledgeBase
+
+        outside = os.path.join(self.test_dir, "outside.txt")
+        with open(outside, "w", encoding="utf-8") as f:
+            f.write("外部旧词麒麟。")
+        kb = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self.assertGreater(kb.add_document(outside), 0)
+
+        with open(outside, "w", encoding="utf-8") as f:
+            f.write("外部新词凤凰。")
+        self.assertGreater(kb.add_document(outside), 0)
+        self.assertTrue(all("麒麟" not in chunk.content for chunk in kb.chunks))
+
+        reloaded = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self.assertTrue(any("凤凰" in chunk.content for chunk in reloaded.chunks))
+        os.remove(outside)
+        after_delete = RAGKnowledgeBase(knowledge_dir=self.knowledge_dir)
+        self.assertTrue(all("凤凰" not in chunk.content for chunk in after_delete.chunks))
+
 
 class TestSecurityDashboard(unittest.TestCase):
     """安全评分仪表盘测试"""
@@ -715,7 +841,7 @@ SUBTASK|3|做C|1,3,9
 
     def test_multi_agent_tool_registered(self):
         """测试多Agent协作工具已注册到内置工具列表"""
-        from nexusagent.core.tools.builtins import BUILTIN_TOOLS
+        from nexusagent.core.tools import BUILTIN_TOOLS
 
         tool_names = [t.name for t in BUILTIN_TOOLS]
         self.assertIn("multi_agent_collaborate", tool_names)

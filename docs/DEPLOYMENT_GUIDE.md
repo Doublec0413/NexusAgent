@@ -291,16 +291,18 @@ print(kb.get_stats())
 
 ### Q: 如何添加自定义工具
 
-1. 在 `nexusagent/core/tools/builtins.py` 中添加：
+1. 在 `nexusagent/core/tools/` 下的对应模块（或新建模块）中添加：
 
 ```python
+from nexusagent.core.tools.base import nexusagent_tool
+
 @nexusagent_tool
 def my_tool(param: str) -> str:
     """工具描述（LLM 根据此描述决定何时调用）"""
     return f"结果: {param}"
 ```
 
-2. 添加到 `BUILTIN_TOOLS` 列表中
+2. 在 `nexusagent/core/tools/__init__.py` 中导入，并加入 `BUILTIN_TOOLS` 列表
 
 ### Q: 如何在 Docker 中运行
 

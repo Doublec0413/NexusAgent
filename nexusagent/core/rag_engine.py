@@ -38,6 +38,8 @@ class DocumentChunk:
     chunk_index: int
     total_chunks: int
     metadata: Dict = field(default_factory=dict)
+    # 词频只跟本切片有关。IDF 存在引擎上，查询时再乘，避免一篇文档变化就重写全部向量。
+    tf: Dict[str, float] = field(default_factory=dict)
     tfidf_vector: Dict[str, float] = field(default_factory=dict)
 
 
@@ -62,15 +64,17 @@ class TFIDFEngine:
 
     工作流程：
     1. 分词（基于字符级 n-gram，支持中英文混合）
-    2. 计算 TF（词频）和 IDF（逆文档频率）
-    3. 生成稀疏向量
-    4. 余弦相似度检索
+    2. 每个切片保存自己的词频；文档频率和 IDF 按整库维护
+    3. 查询时用当前 IDF 给词频加权，再做余弦相似度
     """
 
     def __init__(self):
         self.documents: List[DocumentChunk] = []
+        self.doc_freq: Dict[str, int] = {}
         self.idf_cache: Dict[str, float] = {}
         self._doc_count = 0
+        self._stats_dirty = False
+        self._vectors_ready = False
 
     def _tokenize(self, text: str) -> List[str]:
         """
@@ -107,41 +111,92 @@ class TFIDFEngine:
         total = len(tokens) if tokens else 1
         return {token: count / total for token, count in counter.items()}
 
-    def _compute_idf(self):
-        """计算所有文档的 IDF"""
-        self._doc_count = len(self.documents)
-        doc_freq = Counter()
-
-        for doc in self.documents:
-            tokens = set(self._tokenize(doc.content))
-            for token in tokens:
-                doc_freq[token] += 1
-
-        self.idf_cache = {
+    def _idf_from_doc_freq(self) -> Dict[str, float]:
+        """由当前文档频率得到 IDF。公式与原来整库重算时相同。"""
+        return {
             token: math.log((self._doc_count + 1) / (freq + 1)) + 1
-            for token, freq in doc_freq.items()
+            for token, freq in self.doc_freq.items()
+            if freq > 0
         }
 
-    def index_documents(self, documents: List[DocumentChunk]):
-        """索引文档集合"""
-        self.documents = documents
-        self._compute_idf()
+    def term_freq(self, text: str) -> Dict[str, float]:
+        """只根据这段文本算词频，不碰全局 IDF。"""
+        return self._compute_tf(self._tokenize(text))
 
-        # 为每个文档计算 TF-IDF 向量
+    def remember_chunk(self, doc: DocumentChunk):
+        """新切片加入后，只累加它涉及的文档频率。"""
+        if not doc.tf:
+            doc.tf = self.term_freq(doc.content)
+        self._doc_count += 1
+        for token in doc.tf:
+            self.doc_freq[token] = self.doc_freq.get(token, 0) + 1
+        self._stats_dirty = True
+
+    def forget_chunk(self, doc: DocumentChunk):
+        """切片移除后，扣掉它贡献的文档频率。其他切片的词频不动。"""
+        if self._doc_count > 0:
+            self._doc_count -= 1
+        for token in doc.tf:
+            remaining = self.doc_freq.get(token, 0) - 1
+            if remaining <= 0:
+                self.doc_freq.pop(token, None)
+            else:
+                self.doc_freq[token] = remaining
+        self._stats_dirty = True
+
+    def rebuild_stats(self):
+        """用已保存的词频重建文档频率。缺词频的切片才重新分词。"""
+        self._doc_count = 0
+        self.doc_freq = {}
         for doc in self.documents:
-            tokens = self._tokenize(doc.content)
-            tf = self._compute_tf(tokens)
+            if not doc.tf:
+                doc.tf = self.term_freq(doc.content)
+            self._doc_count += 1
+            for token in doc.tf:
+                self.doc_freq[token] = self.doc_freq.get(token, 0) + 1
+        self.idf_cache = self._idf_from_doc_freq()
+        self._stats_dirty = False
+        self._materialize_vectors()
+
+    def adopt_stats(self, doc_freq: Dict[str, int], doc_count: int, idf: Dict[str, float]):
+        """直接使用索引里读出的文档频率和 IDF。"""
+        self.doc_freq = doc_freq
+        self._doc_count = doc_count
+        self.idf_cache = idf
+        self._stats_dirty = False
+        self._materialize_vectors()
+
+    def flush_stats(self):
+        """文档频率有变化时重算 IDF，再用它给各切片的词频加权。"""
+        if self._stats_dirty:
+            self.idf_cache = self._idf_from_doc_freq()
+            self._stats_dirty = False
+            self._vectors_ready = False
+        if not self._vectors_ready:
+            self._materialize_vectors()
+
+    def _materialize_vectors(self):
+        for doc in self.documents:
             doc.tfidf_vector = {
-                token: tf_val * self.idf_cache.get(token, 1.0)
-                for token, tf_val in tf.items()
+                token: weight * self.idf_cache.get(token, 1.0)
+                for token, weight in doc.tf.items()
             }
+        self._vectors_ready = True
+
+    def index_documents(self, documents: List[DocumentChunk]):
+        """从正文重建全部词频和文档频率。只在没有可用统计时使用。"""
+        self.documents = documents
+        for doc in documents:
+            doc.tf = {}
+            doc.tfidf_vector = {}
+        self.rebuild_stats()
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:
         """
         余弦相似度检索 Top-K
         """
-        query_tokens = self._tokenize(query)
-        query_tf = self._compute_tf(query_tokens)
+        self.flush_stats()
+        query_tf = self.term_freq(query)
         query_vector = {
             token: tf_val * self.idf_cache.get(token, 1.0)
             for token, tf_val in query_tf.items()
@@ -193,6 +248,8 @@ class RAGKnowledgeBase:
     - 文档切片粒度: 512字符 / 128字符重叠
     """
 
+    _SUPPORTED_EXTS = {".txt", ".md", ".py", ".json", ".csv", ".log"}
+
     def __init__(self, knowledge_dir: Optional[str] = None):
         self.knowledge_dir = knowledge_dir or os.path.join(WORKSPACE_DIR, "knowledge")
         self.index_path = os.path.join(self.knowledge_dir, "_index.json")
@@ -200,34 +257,110 @@ class RAGKnowledgeBase:
 
         self.engine = TFIDFEngine()
         self.chunks: List[DocumentChunk] = []
-        self._indexed_hashes: set = set()
+        self.engine.documents = self.chunks
+        # 路径 -> 文件全文 MD5。知识库目录内用相对路径，目录外用绝对路径。
+        self._files: Dict[str, str] = {}
 
-        # 加载已有索引
         self._load_index()
+        self._sync_from_disk()
 
     def _load_index(self):
-        """加载持久化索引"""
-        if os.path.exists(self.index_path):
-            try:
-                with open(self.index_path, "r", encoding="utf-8") as f:
-                    data = json.loads(f.read())
-                    self._indexed_hashes = set(data.get("hashes", []))
-            except Exception:
-                pass
+        """读取词频、文档频率和 IDF。旧的纯指纹文件没有切片，留给目录扫描重建。"""
+        if not os.path.exists(self.index_path):
+            return
+        try:
+            with open(self.index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("chunks"), list)
+                or not isinstance(data.get("files"), dict)
+            ):
+                return
+
+            loaded: List[DocumentChunk] = []
+            for raw in data["chunks"]:
+                if not isinstance(raw, dict):
+                    raise ValueError("切片记录不是对象")
+                tf = raw.get("tf") if isinstance(raw.get("tf"), dict) else {}
+                metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+                loaded.append(DocumentChunk(
+                    chunk_id=str(raw.get("chunk_id", "")),
+                    source_file=str(raw.get("source_file", "")),
+                    content=str(raw.get("content", "")),
+                    chunk_index=int(raw.get("chunk_index", 0)),
+                    total_chunks=int(raw.get("total_chunks", 1)),
+                    metadata=metadata,
+                    tf={str(token): float(weight) for token, weight in tf.items()},
+                ))
+
+            self.chunks.extend(loaded)
+            self._files = {str(path): str(digest) for path, digest in data["files"].items()}
+
+            doc_freq = data.get("doc_freq")
+            idf = data.get("idf")
+            doc_count = data.get("doc_count")
+            stats_ready = (
+                isinstance(doc_freq, dict)
+                and isinstance(idf, dict)
+                and doc_count == len(self.chunks)
+                and all(chunk.tf or not chunk.content for chunk in self.chunks)
+            )
+            if stats_ready:
+                self.engine.adopt_stats(
+                    {str(token): int(freq) for token, freq in doc_freq.items()},
+                    int(doc_count),
+                    {str(token): float(weight) for token, weight in idf.items()},
+                )
+            else:
+                self.engine.rebuild_stats()
+        except Exception:
+            self.chunks.clear()
+            self._files = {}
+            self.engine.doc_freq = {}
+            self.engine.idf_cache = {}
+            self.engine._doc_count = 0
+            self.engine._stats_dirty = False
+            self.engine._vectors_ready = False
 
     def _save_index(self):
-        """保存索引元数据"""
+        """保存正文、词频和当前 IDF。不保存已经乘上 IDF 的向量。"""
+        self.engine.flush_stats()
         data = {
-            "hashes": list(self._indexed_hashes),
-            "chunk_count": len(self.chunks),
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            "version": 1,
+            "files": self._files,
+            "doc_count": self.engine._doc_count,
+            "doc_freq": self.engine.doc_freq,
+            "idf": self.engine.idf_cache,
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "source_file": chunk.source_file,
+                    "content": chunk.content,
+                    "chunk_index": chunk.chunk_index,
+                    "total_chunks": chunk.total_chunks,
+                    "metadata": chunk.metadata,
+                    "tf": chunk.tf,
+                }
+                for chunk in self.chunks
+            ],
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        with open(self.index_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp_path = self.index_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.index_path)
+
+    def _commit(self):
+        self.engine.flush_stats()
+        self._save_index()
 
     def add_document(self, file_path: str, chunk_size: int = 512, overlap: int = 128) -> int:
         """
-        导入文档并切片索引
+        导入文档并切片索引。同一路径内容没变时返回 0；内容变了则替换该路径的旧切片。
 
         Args:
             file_path: 文档路径（支持 .txt, .md, .py, .json）
@@ -237,45 +370,120 @@ class RAGKnowledgeBase:
         Returns:
             新增的切片数量
         """
-        if not os.path.exists(file_path):
+        added = self._upsert_file(file_path, chunk_size, overlap)
+        if added is None:
             return 0
-
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        # 文件去重
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        if content_hash in self._indexed_hashes:
-            return 0
-
-        # 切片
-        file_name = os.path.basename(file_path)
-        new_chunks = self._split_text(content, file_name, chunk_size, overlap)
-
-        self.chunks.extend(new_chunks)
-        self._indexed_hashes.add(content_hash)
-
-        # 重建索引
-        self.engine.index_documents(self.chunks)
-        self._save_index()
-
-        return len(new_chunks)
+        self._commit()
+        return added
 
     def add_directory(self, dir_path: str) -> Dict[str, int]:
-        """批量导入目录下所有支持的文件"""
-        supported_exts = {".txt", ".md", ".py", ".json", ".csv", ".log"}
+        """批量导入目录下所有支持的文件。这一批结束时保存一次。"""
         results = {}
+        changed = False
 
+        for fpath in self._iter_supported_files(dir_path):
+            added = self._upsert_file(fpath)
+            if added is None:
+                continue
+            changed = True
+            if added > 0:
+                results[os.path.basename(fpath)] = added
+
+        if changed:
+            self._commit()
+        return results
+
+    def _sync_from_disk(self):
+        """知识库目录和已经记过的外部路径，与磁盘上的文件对齐一次。"""
+        changed = False
+        seen = set()
+
+        for fpath in self._iter_supported_files(self.knowledge_dir):
+            seen.add(self._source_key(fpath))
+            if self._upsert_file(fpath) is not None:
+                changed = True
+
+        for key in list(self._files):
+            if key in seen:
+                continue
+            path = key if os.path.isabs(key) else os.path.join(self.knowledge_dir, *key.split("/"))
+            if os.path.isfile(path):
+                if self._upsert_file(path) is not None:
+                    changed = True
+            else:
+                self._drop_source(key)
+                changed = True
+
+        if changed:
+            self._commit()
+        else:
+            self.engine.flush_stats()
+
+    def _upsert_file(
+        self, file_path: str, chunk_size: int = 512, overlap: int = 128
+    ) -> Optional[int]:
+        """内容未变返回 None。替换过返回新切片数量，空文件可以是 0。"""
+        if self._is_index_file(file_path) or not os.path.isfile(file_path):
+            return None
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError:
+            return None
+
+        key = self._source_key(file_path)
+        digest = hashlib.md5(content.encode()).hexdigest()
+        if self._files.get(key) == digest:
+            return None
+
+        self._drop_source(key)
+        new_chunks = self._split_text(content, key, chunk_size, overlap)
+        for chunk in new_chunks:
+            chunk.tf = self.engine.term_freq(chunk.content)
+            self.engine.remember_chunk(chunk)
+        self.chunks.extend(new_chunks)
+        self._files[key] = digest
+        return len(new_chunks)
+
+    def _drop_source(self, key: str):
+        """删掉某个路径的切片和指纹，并扣掉这些切片的文档频率。"""
+        for chunk in list(self.chunks):
+            if chunk.source_file == key:
+                self.engine.forget_chunk(chunk)
+        self.chunks[:] = [chunk for chunk in self.chunks if chunk.source_file != key]
+        self._files.pop(key, None)
+
+    def _source_key(self, file_path: str) -> str:
+        abs_path = os.path.realpath(file_path)
+        root = os.path.realpath(self.knowledge_dir)
+        try:
+            rel = os.path.relpath(abs_path, root)
+        except ValueError:
+            return abs_path
+        if rel == os.curdir or rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
+            return abs_path
+        return rel.replace(os.sep, "/")
+
+    def _is_index_file(self, file_path: str) -> bool:
+        try:
+            real = os.path.realpath(file_path)
+        except OSError:
+            return False
+        index = os.path.realpath(self.index_path)
+        return real == index or real == index + ".tmp"
+
+    def _iter_supported_files(self, dir_path: str):
+        if not os.path.isdir(dir_path):
+            return
         for root, _, files in os.walk(dir_path):
             for fname in files:
                 ext = os.path.splitext(fname)[1].lower()
-                if ext in supported_exts:
-                    fpath = os.path.join(root, fname)
-                    count = self.add_document(fpath)
-                    if count > 0:
-                        results[fname] = count
-
-        return results
+                if ext not in self._SUPPORTED_EXTS:
+                    continue
+                fpath = os.path.join(root, fname)
+                if self._is_index_file(fpath):
+                    continue
+                yield fpath
 
     def search(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
         """
@@ -368,3 +576,14 @@ class RAGKnowledgeBase:
             "indexed_files": list(sources),
             "index_size_bytes": os.path.getsize(self.index_path) if os.path.exists(self.index_path) else 0,
         }
+
+
+_kb_singleton: Optional["RAGKnowledgeBase"] = None
+
+
+def get_knowledge_base() -> "RAGKnowledgeBase":
+    """进程内共用一份知识库。第一次调用时读取索引并与目录对齐。"""
+    global _kb_singleton
+    if _kb_singleton is None:
+        _kb_singleton = RAGKnowledgeBase()
+    return _kb_singleton

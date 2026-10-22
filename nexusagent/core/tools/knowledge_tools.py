@@ -9,8 +9,8 @@ def query_knowledge_base(query: str) -> str:
     参数 query 是用户的查询问题。
     返回知识库中与问题最相关的文档片段。
     """
-    from ..rag_engine import RAGKnowledgeBase
-    kb = RAGKnowledgeBase()
+    from ..rag_engine import get_knowledge_base
+    kb = get_knowledge_base()
     results = kb.search(query, top_k=3)
     if not results:
         return "知识库中未找到相关内容。请先导入文档到 workspace/knowledge/ 目录。"
